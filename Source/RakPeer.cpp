@@ -2599,6 +2599,8 @@ bool RakPeer::SendConnectionRequest( const char* host, unsigned short remotePort
 	rcs->playerId=playerId;
 	rcs->nextRequestTime=RakNet::GetTime();
 	rcs->requestsMade=0;
+	rcs->connectionCookie=0;
+	rcs->hasConnectionCookie=false;
 	rcs->data=0;
 	rcs->actionToTake=RequestedConnectionStruct::CONNECT;
 	memcpy(rcs->outgoingPassword, passwordData, passwordDataLength);
@@ -4070,6 +4072,56 @@ namespace RakNet
 				rakPeer->AddPacketToProducer(packet);
 			}
 		}
+		// open.mp's legacy RakNet hook may reject the first direct open request
+		// and answer with ID_OPEN_CONNECTION_COOKIE followed by a little-endian
+		// uint16 cookie.  This packet is deliberately handled before the normal
+		// unconnected/connected dispatch: no RemoteSystemStruct exists yet, and
+		// forwarding it as an application packet would leave the request queued
+		// until it expires.
+		else if ((unsigned char)(data)[0] == ID_OPEN_CONNECTION_COOKIE && length == sizeof(unsigned char) + sizeof(unsigned short))
+		{
+			for (i = 0; i < rakPeer->messageHandlerList.Size(); i++)
+				rakPeer->messageHandlerList[i]->OnDirectSocketReceive(data, length * 8, playerId);
+
+			unsigned short cookie;
+			memcpy(&cookie, data + sizeof(unsigned char), sizeof(cookie));
+
+			RakPeer::RequestedConnectionStruct *rcsFirst, *rcs;
+			rcsFirst = rakPeer->requestedConnectionList.ReadLock();
+			rcs = rcsFirst;
+			while (rcs)
+			{
+				if (rcs->actionToTake == RakPeer::RequestedConnectionStruct::CONNECT && rcs->playerId == playerId)
+				{
+					rcs->connectionCookie = cookie;
+					rcs->hasConnectionCookie = true;
+					// The response is sent immediately.  RunUpdateCycle also uses
+					// this stored cookie for later retries if the datagram is lost.
+					rcs->nextRequestTime = RakNet::GetTime() + 1000;
+
+					unsigned char request[3];
+					request[0] = ID_OPEN_CONNECTION_REQUEST;
+					const unsigned short response = static_cast<unsigned short>(cookie ^ SAMPRakNet::SAMP_PETARDED);
+					memcpy(request + 1, &response, sizeof(response));
+					for (i = 0; i < rakPeer->messageHandlerList.Size(); i++)
+						rakPeer->messageHandlerList[i]->OnDirectSocketSend((const char*)request, sizeof(request) * 8, playerId);
+					SocketLayer::Instance()->SendTo(
+						rakPeer->connectionSocket,
+						(const char*)request,
+						sizeof(request),
+						playerId.binaryAddress,
+						playerId.port);
+					break;
+				}
+
+				rcs = rakPeer->requestedConnectionList.ReadLock();
+			}
+
+			if (rcsFirst)
+				rakPeer->requestedConnectionList.CancelReadLock(rcsFirst);
+
+			return;
+		}
 		// We didn't check this datagram to see if it came from a connected system or not yet.
 		// Therefore, this datagram must be under 17 bits - otherwise it may be normal network traffic as the min size for a raknet send is 17 bits
 		else if ((unsigned char)(data)[0] == ID_OPEN_CONNECTION_REQUEST && length == sizeof(unsigned char)*3)
@@ -4449,7 +4501,14 @@ namespace RakNet
 				rcs->nextRequestTime=timeMS+1000;
 				char c[3];
 				c[0] = ID_OPEN_CONNECTION_REQUEST;
-				c[1] = 0; // Pad - apparently some routers block 1 byte packets
+				const unsigned short requestCookie = rcs->hasConnectionCookie
+					? static_cast<unsigned short>(rcs->connectionCookie ^ SAMPRakNet::SAMP_PETARDED)
+					: 0;
+				// The server reads the two bytes after the packet id as the
+				// cookie response.  A zero value preserves the legacy first
+				// request; after a challenge this is the SA-MP 0.3.7-compatible
+				// response expected by open.mp's legacy RakNet hook.
+				memcpy(c + 1, &requestCookie, sizeof(requestCookie));
 
 				unsigned i;
 				for (i=0; i < messageHandlerList.Size(); i++)

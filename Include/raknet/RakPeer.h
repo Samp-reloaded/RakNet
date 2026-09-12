@@ -688,6 +688,12 @@ namespace RakNet
 			PlayerID playerId;
 			RakNetTime nextRequestTime;
 			unsigned char requestsMade;
+			// open.mp/SA-MP servers may challenge the first direct open request with
+			// ID_OPEN_CONNECTION_COOKIE.  Keep the challenge on the outstanding
+			// request so retries use the same response instead of falling back to an
+			// uninitialised two-byte payload.
+			unsigned short connectionCookie;
+			bool hasConnectionCookie;
 			char *data;
 			unsigned short dataLength;
 			char outgoingPassword[256];
