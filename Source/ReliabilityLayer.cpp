@@ -400,7 +400,8 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 			{
 				unsigned int receivedAcks = incomingAcks.ranges[i].maxIndex - incomingAcks.ranges[i].minIndex;
 				const char* ipPort = playerId.ToString(true);
-				SAMPRakNet::GetCore()->logLn(LogLevel::Warning, "client exceeded 'messageholelimit' (1) %s (%d) Limit: %d", ipPort, receivedAcks, messageHoleLimit);
+				if (auto* core = SAMPRakNet::GetCore())
+					core->logLn(LogLevel::Warning, "client exceeded 'messageholelimit' (1) %s (%d) Limit: %d", ipPort, receivedAcks, messageHoleLimit);
 				incomingAcks.Clear();
 				shouldBanPeer = true;
 				return 1;
@@ -450,7 +451,8 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 			if (statistics.perSecondAcksLimitCounter > acksLimit)
 			{
 				const char * ipPort = playerId.ToString(true);
-				SAMPRakNet::GetCore()->logLn(LogLevel::Warning, "client exceeded 'ackslimit' %s (%d) Limit: %d/sec", ipPort, statistics.perSecondAcksLimitCounter, acksLimit);
+				if (auto* core = SAMPRakNet::GetCore())
+					core->logLn(LogLevel::Warning, "client exceeded 'ackslimit' %s (%d) Limit: %d/sec", ipPort, statistics.perSecondAcksLimitCounter, acksLimit);
 				incomingAcks.Clear();
 				shouldBanPeer = true;
 				return 1;
@@ -592,7 +594,8 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 			if (statistics.perSecondMessagesLimitCounter > messagesLimit)
 			{
 				const char* ipPort = playerId.ToString(true);
-				SAMPRakNet::GetCore()->logLn(LogLevel::Warning, "client exceeded 'messageslimit' %s (%d) Limit: %d/sec", ipPort, statistics.perSecondMessagesLimitCounter, messagesLimit);
+				if (auto* core = SAMPRakNet::GetCore())
+					core->logLn(LogLevel::Warning, "client exceeded 'messageslimit' %s (%d) Limit: %d/sec", ipPort, statistics.perSecondMessagesLimitCounter, messagesLimit);
 				incomingAcks.Clear();
 				shouldBanPeer = true;
 				return 1;
@@ -802,7 +805,8 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 					if (statistics.orderedMessagesOutOfOrder > messageHoleLimit)
 					{
 						const char* ipPort = playerId.ToString(true);
-						SAMPRakNet::GetCore()->logLn(LogLevel::Warning, "Too many out-of-order messages from player %s (%d) Limit: %u (messageholelimit)", ipPort, statistics.orderedMessagesOutOfOrder, messageHoleLimit);
+						if (auto* core = SAMPRakNet::GetCore())
+							core->logLn(LogLevel::Warning, "Too many out-of-order messages from player %s (%d) Limit: %u (messageholelimit)", ipPort, statistics.orderedMessagesOutOfOrder, messageHoleLimit);
 						incomingAcks.Clear();
 						shouldBanPeer = true;
 						return 1;
@@ -1946,7 +1950,8 @@ InternalPacket* ReliabilityLayer::CreateInternalPacketFromBitStream( RakNet::Bit
 		}
 
 #ifdef _DEBUG
-		SAMPRakNet::GetCore()->logLn(LogLevel::Warning, "dropping a split packet from client");
+		if (auto* core = SAMPRakNet::GetCore())
+			core->logLn(LogLevel::Warning, "dropping a split packet from client");
 #endif
 
 		internalPacketPool.ReleasePointer(internalPacket);

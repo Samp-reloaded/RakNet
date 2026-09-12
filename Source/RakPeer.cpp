@@ -4090,7 +4090,8 @@ namespace RakNet
 			{
 				if (rakPeer->GetNumberOfUnverifiedInstances(binaryAddress) > 30)
 				{
-					SAMPRakNet::GetCore()->printLn("Blocking %s due to a 'server full' attack (1)", playerId.ToString());
+					if (auto* core = SAMPRakNet::GetCore())
+						core->printLn("Blocking %s due to a 'server full' attack (1)", playerId.ToString());
 					rakPeer->AddToBanList(rakPeer->PlayerIDToDottedIP(playerId), 120000);
 					return;
 				}
@@ -4099,7 +4100,8 @@ namespace RakNet
 						&& RakNet::GetTime() - s_uiLastProcessedConnTick < 30000
 						&& rakPeer->GetNumberOfActivePeers() == (rakPeer->GetMaximumNumberOfPeers() - 1))
 				{
-					SAMPRakNet::GetCore()->printLn("Blocking %s due to a 'server full' attack (2)", playerId.ToString());
+					if (auto* core = SAMPRakNet::GetCore())
+						core->printLn("Blocking %s due to a 'server full' attack (2)", playerId.ToString());
 					rakPeer->AddToBanList(rakPeer->PlayerIDToDottedIP(playerId), 120000);
 					return;
 				}
@@ -4322,7 +4324,8 @@ namespace RakNet
 					if ( errorCode != 0 && endThreads == false )
 					{
 	#ifdef _DO_PRINTF
-						SAMPRakNet::GetCore()->printLn( "Server RecvFrom critical failure!" );
+						if (auto* core = SAMPRakNet::GetCore())
+							core->printLn( "Server RecvFrom critical failure!" );
 	#endif
 						// Some kind of critical error
 						// peer->isRecvfromThreadActive=false;
@@ -4546,7 +4549,8 @@ namespace RakNet
 
 	#ifdef _DO_PRINTF
 					const char* ipPort = playerId.ToString(true);
-					SAMPRakNet::GetCore()->printLn("Connection dropped for player %s", ipPort);
+					if (auto* core = SAMPRakNet::GetCore())
+						core->printLn("Connection dropped for player %s", ipPort);
 	#endif
 					CloseConnectionInternal( playerId, false, true, 0 );
 					continue;
@@ -4589,7 +4593,8 @@ namespace RakNet
 						RakNetTime diff = RakNet::GetTime() - remoteSystem->connectionTime;
 						if (diff > 30000)
 						{
-							SAMPRakNet::GetCore()->printLn("Kicking %s because they didn't logon to the game.", PlayerIDToDottedIP(playerId));
+							if (auto* core = SAMPRakNet::GetCore())
+								core->printLn("Kicking %s because they didn't logon to the game.", PlayerIDToDottedIP(playerId));
 							NotifyAndFlagForDisconnect(playerId, true, 0);
 							continue;
 						}
@@ -4682,7 +4687,8 @@ namespace RakNet
 								
 								CloseConnectionInternal(playerId, false, true, 0);
 #ifdef _DO_PRINTF
-								SAMPRakNet::GetCore()->printLn("Temporarily banning %s for sending nonsense data", playerId.ToString());
+								if (auto* core = SAMPRakNet::GetCore())
+									core->printLn("Temporarily banning %s for sending nonsense data", playerId.ToString());
 #endif
 
 #if !defined(_COMPATIBILITY_1)
@@ -5018,7 +5024,8 @@ namespace RakNet
 								// Tell the remote system the connection failed
 								NotifyAndFlagForDisconnect(playerId, true, 0);
 	#ifdef _DO_PRINTF
-								SAMPRakNet::GetCore()->printLn( "Error: Got a connection accept when we didn't request the connection." );
+								if (auto* core = SAMPRakNet::GetCore())
+									core->printLn( "Error: Got a connection accept when we didn't request the connection." );
 	#endif
 								if (data)
 									delete [] data;
@@ -5029,6 +5036,17 @@ namespace RakNet
 							// Do nothing - packet is received through network.
 							// This shouldn't happen as it's an internal packet.
 							delete[] data;
+						}
+						else if (data[0] == (unsigned char)ID_AUTH_KEY)
+						{
+							// SA-MP's connect-time auth challenge is a user-visible packet for
+							// the client transport.  Keep it in the producer queue instead of
+							// dropping it with RakNet's internal packets below ID_RPC.
+							packet = AllocPacket(byteSize, data);
+							packet->bitSize = bitSize;
+							packet->playerId = playerId;
+							packet->playerIndex = (PlayerIndex)remoteSystemIndex;
+							AddPacketToProducer(packet);
 						}
 						else if (data[0] >= (unsigned char)ID_RPC)
 						{

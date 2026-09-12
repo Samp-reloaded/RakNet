@@ -702,11 +702,14 @@ bool SAMPRakNet::OnConnectionRequest(
 			{
 				if (!minConnectionLogTick || tickTime - minConnectionLogTick > configuredMinConnTime)
 				{
-					core_->logLn(
-						LogLevel::Warning,
-						"Minimum time between new connections (%u) exceeded for %s. Ignoring the request.",
-						configuredMinConnTime,
-						playerId.ToString());
+					if (core_)
+					{
+						core_->logLn(
+							LogLevel::Warning,
+							"Minimum time between new connections (%u) exceeded for %s. Ignoring the request.",
+							configuredMinConnTime,
+							playerId.ToString());
+					}
 					minConnectionLogTick = tickTime;
 				}
 				return false;
@@ -724,7 +727,8 @@ bool SAMPRakNet::OnConnectionRequest(
 #ifdef _DO_PRINTF
 			if (SAMPRakNet::ShouldLogCookies())
 			{
-				core_->printLn("%s requests connection cookie", playerId.ToString());
+				if (core_)
+					core_->printLn("%s requests connection cookie", playerId.ToString());
 			}
 #endif
 			char c[3];

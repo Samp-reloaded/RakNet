@@ -222,6 +222,11 @@ public:
 
 	static bool IsOmpEncryptionEnabled()
 	{
+		// The client embeds RakNet without the server ICore instance.  Encryption is
+		// therefore disabled until a server-side core is explicitly installed.
+		if (!core_)
+			return false;
+
 		static bool* isEnabled = core_->getConfig().getBool("network.use_omp_encryption");
 		return isEnabled ? *isEnabled : false;
 	}

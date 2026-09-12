@@ -385,7 +385,8 @@ int SocketLayer::RecvFrom( const SOCKET s, RakPeer *rakPeer, int *errorCode )
 #ifdef _DEBUG
 		else {
 			uint8_t* const addr = reinterpret_cast<uint8_t*>(&sa.sin_addr.s_addr);
-			SAMPRakNet::GetCore()->printLn("Dropping bad packet from %u.%u.%u.%u:%u!", addr[0], addr[1], addr[2], addr[3], sa.sin_port);
+			if (auto* core = SAMPRakNet::GetCore())
+				core->printLn("Dropping bad packet from %u.%u.%u.%u:%u!", addr[0], addr[1], addr[2], addr[3], sa.sin_port);
 		}
 #endif
 		return 1;
