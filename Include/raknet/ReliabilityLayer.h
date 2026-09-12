@@ -52,6 +52,7 @@ namespace RakNet
 	struct SplitPacketChannel
 	{
 		RakNetTimeNS lastUpdateTime;
+		unsigned int totalDataBytes = 0;
 		DataStructures::OrderedList<SplitPacketIndexType, InternalPacket*, SplitPacketIndexComp> splitPacketList;
 	};
 	int RAK_DLL_EXPORT SplitPacketChannelComp( SplitPacketIdType const &key, SplitPacketChannel* const &data );
@@ -221,7 +222,7 @@ namespace RakNet
 		void SplitPacket( InternalPacket *internalPacket, int MTUSize );
 
 		/// Insert a packet into the split packet list
-		void InsertIntoSplitPacketList( InternalPacket * internalPacket, RakNetTimeNS time );
+		bool InsertIntoSplitPacketList( InternalPacket * internalPacket, RakNetTimeNS time );
 
 		/// Take all split chunks with the specified splitPacketId and try to reconstruct a packet. If we can, allocate and return it.  Otherwise return 0
 		InternalPacket * BuildPacketFromSplitPacketList( SplitPacketIdType splitPacketId, RakNetTimeNS time );

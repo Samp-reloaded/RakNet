@@ -24,6 +24,10 @@
 
 #include "../SAMPRakNet.hpp"
 
+#include <cstddef>
+#include <string>
+#include <string_view>
+
 // alloca
 #ifdef _COMPATIBILITY_1
 #elif defined(_WIN32)
@@ -49,6 +53,46 @@ static const float PING_MULTIPLIER_TO_RESEND=3.0; // So internet ping variation 
 static const RakNetTime MIN_PING_TO_RESEND=30; // So system timer changes and CPU lag don't send needless resends
 static const RakNetTimeNS TIME_TO_NEW_SAMPLE=500000; // How many ns to wait before starting a new sample.  This way buffers have time to overflow or relax at the new send rate, if they are indeed going to overflow.
 static const RakNetTimeNS MAX_TIME_TO_SAMPLE=250000; // How many ns to sample the connection before deciding on a course of action(increase or decrease throughput). You must be at full send rate the whole time
+
+namespace
+{
+	// A split packet chunk is smaller than MAXIMUM_MTU_SIZE. Keep the number of
+	// chunks and aggregate allocation bounded before accepting untrusted metadata.
+	constexpr RakNet::SplitPacketIndexType MAX_SPLIT_PACKET_COUNT = 4096;
+	constexpr unsigned int MAX_SPLIT_PACKET_CHANNELS = 256;
+	constexpr std::size_t MAX_SPLIT_PACKET_DATA_BYTES = 4u * 1024u * 1024u;
+
+	void LogSplitPacketIssue(
+		std::string_view reason,
+		RakNet::SplitPacketIdType splitPacketId,
+		RakNet::SplitPacketIndexType splitPacketIndex,
+		RakNet::SplitPacketIndexType splitPacketCount,
+		std::size_t dataBytes,
+		std::size_t pendingBytes = 0)
+	{
+		ICore* core = SAMPRakNet::GetCore();
+		if (!core)
+			return;
+
+		std::string message = "[raknet] split packet rejected: ";
+		message.append(reason);
+		message.append(" (id=");
+		message.append(std::to_string(splitPacketId));
+		message.append(", index=");
+		message.append(std::to_string(splitPacketIndex));
+		message.append(", count=");
+		message.append(std::to_string(splitPacketCount));
+		message.append(", dataBytes=");
+		message.append(std::to_string(dataBytes));
+		if (pendingBytes != 0)
+		{
+			message.append(", pendingBytes=");
+			message.append(std::to_string(pendingBytes));
+		}
+		message.push_back(')');
+		core->logLn(LogLevel::Warning, "%s", message.c_str());
+	}
+}
 
 #ifdef _MSC_VER
 #pragma warning( push )
@@ -650,11 +694,17 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 						// Verify some parameters to make sure we don't get junk data
 
 
-						// Check for a rebuilt packet
-						InsertIntoSplitPacketList( internalPacket, time );
+						// Check for a rebuilt packet. The insert consumes the chunk on
+						// both success and rejection.
+						const SplitPacketIdType splitPacketId = internalPacket->splitPacketId;
+						if ( !InsertIntoSplitPacketList( internalPacket, time ) )
+						{
+							internalPacket = 0;
+							goto CONTINUE_SOCKET_DATA_PARSE_LOOP;
+						}
 
 						// Sequenced
-						internalPacket = BuildPacketFromSplitPacketList( internalPacket->splitPacketId, time );
+						internalPacket = BuildPacketFromSplitPacketList( splitPacketId, time );
 
 						if ( internalPacket )
 						{
@@ -704,9 +754,14 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 				if ( internalPacket->reliability != RELIABLE_ORDERED )
 					internalPacket->orderingChannel = 255; // Use 255 to designate not sequenced and not ordered
 
-				InsertIntoSplitPacketList( internalPacket, time );
+				const SplitPacketIdType splitPacketId = internalPacket->splitPacketId;
+				if ( !InsertIntoSplitPacketList( internalPacket, time ) )
+				{
+					internalPacket = 0;
+					goto CONTINUE_SOCKET_DATA_PARSE_LOOP;
+				}
 
-				internalPacket = BuildPacketFromSplitPacketList( internalPacket->splitPacketId, time );
+				internalPacket = BuildPacketFromSplitPacketList( splitPacketId, time );
 
 				if ( internalPacket == 0 )
 				{
@@ -1921,6 +1976,7 @@ InternalPacket* ReliabilityLayer::CreateInternalPacketFromBitStream( RakNet::Bit
 
 		if ( bitStreamSucceeded == false )
 		{
+			LogSplitPacketIssue("split-id-truncated", 0, 0, 0, 0);
 			internalPacketPool.ReleasePointer( internalPacket );
 			return 0;
 		}
@@ -1933,6 +1989,7 @@ InternalPacket* ReliabilityLayer::CreateInternalPacketFromBitStream( RakNet::Bit
 
 		if ( bitStreamSucceeded == false )
 		{
+			LogSplitPacketIssue("split-index-truncated", internalPacket->splitPacketId, 0, 0, 0);
 			internalPacketPool.ReleasePointer( internalPacket );
 			return 0;
 		}
@@ -1945,17 +2002,40 @@ InternalPacket* ReliabilityLayer::CreateInternalPacketFromBitStream( RakNet::Bit
 
 		if ( bitStreamSucceeded == false )
 		{
+			LogSplitPacketIssue("split-count-truncated", internalPacket->splitPacketId, internalPacket->splitPacketIndex, 0, 0);
 			internalPacketPool.ReleasePointer( internalPacket );
 			return 0;
 		}
 
-#ifdef _DEBUG
-		if (auto* core = SAMPRakNet::GetCore())
-			core->logLn(LogLevel::Warning, "dropping a split packet from client");
-#endif
+		if ( internalPacket->splitPacketCount == 0 )
+		{
+			LogSplitPacketIssue("split-count-zero", internalPacket->splitPacketId, internalPacket->splitPacketIndex, internalPacket->splitPacketCount, 0);
+			internalPacketPool.ReleasePointer( internalPacket );
+			return 0;
+		}
 
-		internalPacketPool.ReleasePointer(internalPacket);
-		return 0;
+		if ( internalPacket->splitPacketCount > MAX_SPLIT_PACKET_COUNT )
+		{
+			LogSplitPacketIssue("split-count-limit", internalPacket->splitPacketId, internalPacket->splitPacketIndex, internalPacket->splitPacketCount, 0);
+			internalPacketPool.ReleasePointer( internalPacket );
+			return 0;
+		}
+
+		if ( internalPacket->splitPacketIndex >= internalPacket->splitPacketCount )
+		{
+			LogSplitPacketIssue("split-index-out-of-range", internalPacket->splitPacketId, internalPacket->splitPacketIndex, internalPacket->splitPacketCount, 0);
+			internalPacketPool.ReleasePointer( internalPacket );
+			return 0;
+		}
+
+		// The historical server-side anti-abuse rule is retained. The client
+		// must accept and reassemble server datagrams, however.
+		if ( !SAMPRakNet::IsClientRole() )
+		{
+			LogSplitPacketIssue("server-policy-reject", internalPacket->splitPacketId, internalPacket->splitPacketIndex, internalPacket->splitPacketCount, 0);
+			internalPacketPool.ReleasePointer( internalPacket );
+			return 0;
+		}
 	}
 	else
 	{
@@ -1980,17 +2060,22 @@ InternalPacket* ReliabilityLayer::CreateInternalPacketFromBitStream( RakNet::Bit
 
 	if ( bitStreamSucceeded == false )
 	{
+		if ( isSplitPacket )
+			LogSplitPacketIssue("split-length-truncated", internalPacket->splitPacketId, internalPacket->splitPacketIndex, internalPacket->splitPacketCount, 0);
 		internalPacketPool.ReleasePointer( internalPacket );
 		return 0;
 	}
 
 	internalPacket->dataBitLength = length;
+	const std::size_t dataBytes = BITS_TO_BYTES( internalPacket->dataBitLength );
 
 	// 10/08/05 - Disabled assert since this hits from offline packets arriving when the sender does not know we just connected, which is an unavoidable condition sometimes
 	//	RakAssert( internalPacket->dataBitLength > 0 && BITS_TO_BYTES( internalPacket->dataBitLength ) < MAXIMUM_MTU_SIZE );
 
-	if ( ! ( internalPacket->dataBitLength > 0 && BITS_TO_BYTES( internalPacket->dataBitLength ) < MAXIMUM_MTU_SIZE ) )
+	if ( ! ( internalPacket->dataBitLength > 0 && dataBytes < MAXIMUM_MTU_SIZE ) )
 	{
+		if ( isSplitPacket )
+			LogSplitPacketIssue("split-length-invalid", internalPacket->splitPacketId, internalPacket->splitPacketIndex, internalPacket->splitPacketCount, dataBytes);
 		// 10/08/05 - internalPacket->data wasn't allocated yet
 		//	delete [] internalPacket->data;
 		internalPacketPool.ReleasePointer( internalPacket );
@@ -2016,6 +2101,8 @@ InternalPacket* ReliabilityLayer::CreateInternalPacketFromBitStream( RakNet::Bit
 
 	if ( bitStreamSucceeded == false )
 	{
+		if ( isSplitPacket )
+			LogSplitPacketIssue("split-payload-truncated", internalPacket->splitPacketId, internalPacket->splitPacketIndex, internalPacket->splitPacketCount, dataBytes);
 		if (internalPacket->data)
 		{
 			delete [] internalPacket->data;
@@ -2274,18 +2361,67 @@ void ReliabilityLayer::SplitPacket( InternalPacket *internalPacket, int MTUSize 
 //-------------------------------------------------------------------------------------------------------
 // Insert a packet into the split packet list
 //-------------------------------------------------------------------------------------------------------
-void ReliabilityLayer::InsertIntoSplitPacketList( InternalPacket * internalPacket, RakNetTimeNS time )
+bool ReliabilityLayer::InsertIntoSplitPacketList( InternalPacket * internalPacket, RakNetTimeNS time )
 {
+	const std::size_t dataBytes = BITS_TO_BYTES( internalPacket->dataBitLength );
+	const auto releaseChunk = [this, internalPacket]()
+	{
+		delete [] internalPacket->data;
+		internalPacketPool.ReleasePointer( internalPacket );
+	};
+
 	bool objectExists;
 	unsigned index;
 	index=splitPacketChannelList.GetIndexFromKey(internalPacket->splitPacketId, &objectExists);
 	if (objectExists==false)
 	{
+		if ( splitPacketChannelList.Size() >= MAX_SPLIT_PACKET_CHANNELS )
+		{
+			LogSplitPacketIssue("split-channel-limit", internalPacket->splitPacketId, internalPacket->splitPacketIndex, internalPacket->splitPacketCount, dataBytes);
+			releaseChunk();
+			return false;
+		}
+
 		SplitPacketChannel *newChannel = new SplitPacketChannel;
-        index=splitPacketChannelList.Insert(internalPacket->splitPacketId, newChannel);
+		index=splitPacketChannelList.Insert(internalPacket->splitPacketId, newChannel);
 	}
-	splitPacketChannelList[index]->splitPacketList.Insert(internalPacket->splitPacketIndex, internalPacket);
-	splitPacketChannelList[index]->lastUpdateTime=time;
+
+	SplitPacketChannel* channel = splitPacketChannelList[index];
+	if ( channel->splitPacketList.Size() > 0 )
+	{
+		const InternalPacket* firstChunk = channel->splitPacketList[0];
+		if ( firstChunk->splitPacketCount != internalPacket->splitPacketCount )
+		{
+			LogSplitPacketIssue("split-count-mismatch", internalPacket->splitPacketId, internalPacket->splitPacketIndex, internalPacket->splitPacketCount, dataBytes, channel->totalDataBytes);
+			releaseChunk();
+			return false;
+		}
+
+		if ( channel->splitPacketList.HasData( internalPacket->splitPacketIndex ) )
+		{
+			LogSplitPacketIssue("split-index-duplicate", internalPacket->splitPacketId, internalPacket->splitPacketIndex, internalPacket->splitPacketCount, dataBytes, channel->totalDataBytes);
+			releaseChunk();
+			return false;
+		}
+	}
+
+	if ( dataBytes > MAX_SPLIT_PACKET_DATA_BYTES || channel->totalDataBytes > MAX_SPLIT_PACKET_DATA_BYTES - dataBytes )
+	{
+		LogSplitPacketIssue("split-data-limit", internalPacket->splitPacketId, internalPacket->splitPacketIndex, internalPacket->splitPacketCount, dataBytes, channel->totalDataBytes);
+		releaseChunk();
+		return false;
+	}
+
+	const unsigned insertedIndex = channel->splitPacketList.Insert(internalPacket->splitPacketIndex, internalPacket);
+	if ( insertedIndex == static_cast<unsigned>( -1 ) )
+	{
+		LogSplitPacketIssue("split-index-duplicate", internalPacket->splitPacketId, internalPacket->splitPacketIndex, internalPacket->splitPacketCount, dataBytes, channel->totalDataBytes);
+		releaseChunk();
+		return false;
+	}
+
+	channel->totalDataBytes += static_cast<unsigned int>( dataBytes );
+	channel->lastUpdateTime=time;
 
 	if (splitMessageProgressInterval &&
 		splitPacketChannelList[index]->splitPacketList[0]->splitPacketIndex==0 &&
@@ -2318,6 +2454,8 @@ void ReliabilityLayer::InsertIntoSplitPacketList( InternalPacket * internalPacke
 		memcpy(progressIndicator->data+sizeof(MessageID)+sizeof(unsigned int)*3, splitPacketChannelList[index]->splitPacketList[0]->data, BITS_TO_BYTES(splitPacketChannelList[index]->splitPacketList[0]->dataBitLength));
 		outputQueue.Push(progressIndicator);
 	}
+
+	return true;
 }
 
 //-------------------------------------------------------------------------------------------------------
@@ -2334,32 +2472,41 @@ InternalPacket * ReliabilityLayer::BuildPacketFromSplitPacketList( SplitPacketId
 
 	i=splitPacketChannelList.GetIndexFromKey(splitPacketId, &objectExists);
 
-	RakAssert(objectExists);
+	if ( !objectExists )
+		return 0;
 
+	SplitPacketChannel* channel = splitPacketChannelList[i];
+	if ( channel->splitPacketList.Size() == 0 )
+		return 0;
 
-	if (splitPacketChannelList[i]->splitPacketList.Size()==splitPacketChannelList[i]->splitPacketList[0]->splitPacketCount)
+	InternalPacket* firstChunk = channel->splitPacketList[0];
+	if ( channel->splitPacketList.Size() == firstChunk->splitPacketCount &&
+		channel->totalDataBytes <= MAX_SPLIT_PACKET_DATA_BYTES )
 	{
 		// Reconstruct
-		internalPacket = CreateInternalPacketCopy( splitPacketChannelList[i]->splitPacketList[0], 0, 0, time );
+		internalPacket = CreateInternalPacketCopy( firstChunk, 0, 0, time );
 		internalPacket->dataBitLength=0;
-		for (j=0; j < splitPacketChannelList[i]->splitPacketList.Size(); j++)
-			internalPacket->dataBitLength+=splitPacketChannelList[i]->splitPacketList[j]->dataBitLength;
+		for (j=0; j < channel->splitPacketList.Size(); j++)
+			internalPacket->dataBitLength += channel->splitPacketList[j]->dataBitLength;
 
 		internalPacket->data = new unsigned char[ BITS_TO_BYTES( internalPacket->dataBitLength ) ];
+		internalPacket->splitPacketId = 0;
+		internalPacket->splitPacketIndex = 0;
+		internalPacket->splitPacketCount = 0;
 
 		byteProgress=0;
-		for (j=0; j < splitPacketChannelList[i]->splitPacketList.Size(); j++)
+		for (j=0; j < channel->splitPacketList.Size(); j++)
 		{
-			memcpy(internalPacket->data+byteProgress, splitPacketChannelList[i]->splitPacketList[j]->data, BITS_TO_BYTES(splitPacketChannelList[i]->splitPacketList[j]->dataBitLength));
-			byteProgress+=BITS_TO_BYTES(splitPacketChannelList[i]->splitPacketList[j]->dataBitLength);
+			memcpy(internalPacket->data+byteProgress, channel->splitPacketList[j]->data, BITS_TO_BYTES(channel->splitPacketList[j]->dataBitLength));
+			byteProgress+=BITS_TO_BYTES(channel->splitPacketList[j]->dataBitLength);
 		}
 
-		for (j=0; j < splitPacketChannelList[i]->splitPacketList.Size(); j++)
+		for (j=0; j < channel->splitPacketList.Size(); j++)
 		{
-			delete [] splitPacketChannelList[i]->splitPacketList[j]->data;
-			internalPacketPool.ReleasePointer(splitPacketChannelList[i]->splitPacketList[j]);
+			delete [] channel->splitPacketList[j]->data;
+			internalPacketPool.ReleasePointer(channel->splitPacketList[j]);
 		}
-		delete splitPacketChannelList[i];
+		delete channel;
 		splitPacketChannelList.RemoveAtIndex(i);
 
 		return internalPacket;
