@@ -46,6 +46,7 @@ RakClient::~RakClient()
 #endif
 bool RakClient::Connect( const char* host, unsigned short serverPort, unsigned short clientPort, unsigned int depreciated, int threadSleepTimer )
 {
+	SAMPRakNet::SetClientRole();
 	RakPeer::Disconnect( 100 );
 	
 	RakPeer::Initialize( 1, clientPort, threadSleepTimer );
@@ -281,6 +282,7 @@ void RakClient::PingServer( void )
 
 void RakClient::PingServer( const char* host, unsigned short serverPort, unsigned short clientPort, bool onlyReplyOnAcceptingConnections )
 {
+	SAMPRakNet::SetClientRole();
 	RakPeer::Initialize( 1, clientPort, 0 );
 	RakPeer::Ping( host, serverPort, onlyReplyOnAcceptingConnections );
 }

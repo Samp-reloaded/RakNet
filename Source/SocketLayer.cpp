@@ -72,6 +72,39 @@ namespace RakNet
 
 #ifdef _DEBUG
 #include <stdio.h>
+
+namespace
+{
+bool IsOfflineConnectionPacket(const unsigned char id) noexcept
+{
+	return id == static_cast<unsigned char>(ID_OPEN_CONNECTION_REQUEST)
+		|| id == static_cast<unsigned char>(ID_OPEN_CONNECTION_REPLY)
+		|| id == static_cast<unsigned char>(ID_OPEN_CONNECTION_COOKIE);
+}
+
+void TraceClientEndpoint(const char* direction, const unsigned char id, const int length, const unsigned int binaryAddress, const unsigned short port, const int encodedLength = -1, const unsigned char checksum = 0)
+{
+	const auto* address = reinterpret_cast<const unsigned char*>(&binaryAddress);
+	if (encodedLength >= 0)
+	{
+		printf("[RakNet][client-trace] %s offline id=0x%02X original_len=%d encoded_len=%d checksum=0x%02X endpoint=%u.%u.%u.%u:%u\n",
+			direction,
+			id,
+			length,
+			encodedLength,
+			checksum,
+			address[0], address[1], address[2], address[3], port);
+	}
+	else
+	{
+		printf("[RakNet][client-trace] %s offline id=0x%02X raw_len=%d endpoint=%u.%u.%u.%u:%u\n",
+			direction,
+			id,
+			length,
+			address[0], address[1], address[2], address[3], port);
+	}
+}
+}
 #endif
 
 SocketLayer::SocketLayer()
@@ -370,25 +403,40 @@ int SocketLayer::RecvFrom( const SOCKET s, RakPeer *rakPeer, int *errorCode )
 
 	if ( len != SOCKET_ERROR )
 	{
+		const unsigned short portnum = ntohs(sa.sin_port);
+#ifdef _DEBUG
+		if (SAMPRakNet::IsClientRole() && len > 0 && IsOfflineConnectionPacket(static_cast<unsigned char>(data[0])))
+		{
+			TraceClientEndpoint("inbound", static_cast<unsigned char>(data[0]), len, sa.sin_addr.s_addr, portnum);
+		}
+#endif
+
 		if (len > 10 && data[0] == 'S' && data[1] == 'A' && data[2] == 'M' && data[3] == 'P')
 		{
 			SAMPRakNet::HandleQuery(s, len2, sa, data, len);
 			return 1;
 		}
 
-		unsigned short portnum;
-		portnum = ntohs( sa.sin_port );
-		uint8_t* decrypted = SAMPRakNet::Decrypt((uint8_t*)data, len);
-		if (decrypted) {
-			ProcessNetworkPacket(sa.sin_addr.s_addr, portnum, (char*)decrypted, len - 1, rakPeer);
+		if (SAMPRakNet::IsClientRole())
+		{
+			// Legacy SA-MP servers send ordinary RakNet datagrams to clients.
+			// The client encoder is applied only on the outbound path.
+			ProcessNetworkPacket(sa.sin_addr.s_addr, portnum, data, len, rakPeer);
 		}
+		else
+		{
+			uint8_t* decrypted = SAMPRakNet::Decrypt((uint8_t*)data, len);
+			if (decrypted) {
+				ProcessNetworkPacket(sa.sin_addr.s_addr, portnum, (char*)decrypted, len - 1, rakPeer);
+			}
 #ifdef _DEBUG
-		else {
-			uint8_t* const addr = reinterpret_cast<uint8_t*>(&sa.sin_addr.s_addr);
-			if (auto* core = SAMPRakNet::GetCore())
-				core->printLn("Dropping bad packet from %u.%u.%u.%u:%u!", addr[0], addr[1], addr[2], addr[3], sa.sin_port);
-		}
+			else {
+				uint8_t* const addr = reinterpret_cast<uint8_t*>(&sa.sin_addr.s_addr);
+				if (auto* core = SAMPRakNet::GetCore())
+					core->printLn("Dropping bad packet from %u.%u.%u.%u:%u!", addr[0], addr[1], addr[2], addr[3], sa.sin_port);
+			}
 #endif
+		}
 		return 1;
 	}
 	else
@@ -457,23 +505,43 @@ int SocketLayer::SendTo( SOCKET s, const char *data, int length, unsigned int bi
 	do
 	{
 		// TODO - use WSASendTo which is faster.
-		auto encrypted = (uint8_t*)data;
-		if (SAMPRakNet::IsOmpEncryptionEnabled())
+		if (SAMPRakNet::IsClientRole())
+		{
+			// RakNet's legacy SA-MP client wire format is encoded before it is
+			// sent.  The destination port, rather than the client's local port,
+			// participates in the historical mask.
+			if (length < 0 || length > MAXIMUM_MTU_SIZE - 1)
+				return -1;
+
+			auto encoded = SAMPRakNet::EncryptLegacy((const uint8_t*)data, length, port);
+			if (!encoded)
+				return -1;
+
+#ifdef _DEBUG
+			if (length > 0 && IsOfflineConnectionPacket(static_cast<unsigned char>(data[0])))
+			{
+				TraceClientEndpoint("outbound", static_cast<unsigned char>(data[0]), length, binaryAddress, port, length + 1, encoded[0]);
+			}
+#endif
+
+			len = sendto(s, (const char*)encoded, length + 1, 0, (const sockaddr*)&sa, sizeof(struct sockaddr_in));
+		}
+		else if (SAMPRakNet::IsOmpEncryptionEnabled())
 		{
 			auto encryptionData = SAMPRakNet::GetOmpPlayerEncryptionData(PlayerID { binaryAddress, port });
 			if (encryptionData)
 			{
-				encrypted = SAMPRakNet::Encrypt(encryptionData, (uint8_t*)data, length);
+				auto* encrypted = SAMPRakNet::Encrypt(encryptionData, (uint8_t*)data, length);
 				len = sendto(s, (char*)encrypted, length + 1, 0, (const sockaddr*)&sa, sizeof(struct sockaddr_in));
 			}
 			else
 			{
-				len = sendto(s, (char*)encrypted, length, 0, (const sockaddr*)&sa, sizeof(struct sockaddr_in));
+				len = sendto(s, data, length, 0, (const sockaddr*)&sa, sizeof(struct sockaddr_in));
 			}
 		}
 		else
 		{
-			len = sendto(s, (char*)encrypted, length, 0, (const sockaddr*)&sa, sizeof(struct sockaddr_in));
+			len = sendto(s, data, length, 0, (const sockaddr*)&sa, sizeof(struct sockaddr_in));
 		}
 	}
 	while ( len == 0 );

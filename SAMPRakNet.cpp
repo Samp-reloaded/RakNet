@@ -8,6 +8,7 @@
 #include <RakPeer.h>
 #include <SocketLayer.h>
 #include <PacketEnumerations.h>
+#include <LegacyClientWire.h>
 
 uint8_t SAMPRakNet::decryptBuffer_[MAXIMUM_MTU_SIZE];
 uint8_t SAMPRakNet::encryptBuffer_[MAXIMUM_MTU_SIZE];
@@ -26,6 +27,7 @@ ICore* SAMPRakNet::core_ = nullptr;
 FlatHashSet<uint32_t> SAMPRakNet::incomingConnections_;
 RakNet::RakNetTime SAMPRakNet::gracePeriod_ = 0;
 FlatHashMap<PlayerAddressHash, SAMPRakNet::OmpPlayerEncryptionData> SAMPRakNet::ompPlayers_;
+SAMPRakNet::NetworkRole SAMPRakNet::networkRole_ = SAMPRakNet::NetworkRole::Server;
 
 uint16_t
 SAMPRakNet::
@@ -321,6 +323,21 @@ SAMPRakNet::
         return nullptr;
     }
 	return decryptBuffer_;
+}
+
+uint8_t*
+SAMPRakNet::
+    EncryptLegacy(uint8_t const* src, int len, uint16_t destinationPort)
+{
+    if (src == nullptr || len < 0 || len > MAXIMUM_MTU_SIZE - 1)
+        return nullptr;
+
+    const auto sourceSize = static_cast<size_t>(len);
+    if (!RakNet::LegacyWire::EncodeClientDatagram(
+            src, sourceSize, destinationPort, encryptBuffer_, MAXIMUM_MTU_SIZE)) {
+        return nullptr;
+    }
+    return encryptBuffer_;
 }
 
 uint8_t*

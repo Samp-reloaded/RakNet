@@ -47,6 +47,12 @@ using PlayerAddressHash = uint64_t;
 class SAMPRakNet
 {
 public:
+	enum class NetworkRole
+	{
+		Server,
+		Client,
+	};
+
 	static constexpr int ENCRYPTION_KEY_SIZE = 4;
 	static constexpr int MAGIC_OMP_IDENTIFICATION_NUMBER = 0x006F6D70; // sent to client on connect request and handled there so we know it's a real packet from us. it's basically 'omp' in 32bit btw
 	static constexpr int OMP_PETARDED = 0x6D70; // it's basically 'mp' in 16bit
@@ -103,7 +109,16 @@ public:
 		return (static_cast<PlayerAddressHash>(player.binaryAddress) << 16) | player.port;
 	}
 
+	static void SetNetworkRole(NetworkRole role) { networkRole_ = role; }
+	static void SetClientRole() { SetNetworkRole(NetworkRole::Client); }
+	static void SetServerRole() { SetNetworkRole(NetworkRole::Server); }
+	static bool IsClientRole() { return networkRole_ == NetworkRole::Client; }
+
 	static uint8_t* Decrypt(uint8_t const* src, int len);
+	// The legacy SA-MP wire format is direction-sensitive: client datagrams are
+	// encoded with the destination server port, while client receives are raw.
+	// Keep this separate from the open.mp per-player server encryption encoder.
+	static uint8_t* EncryptLegacy(uint8_t const* src, int len, uint16_t destinationPort);
 	static uint8_t* Encrypt(const OmpPlayerEncryptionData* encryptionData, uint8_t const* src, int len);
 
 	static uint16_t GetPort();
@@ -256,4 +271,5 @@ private:
 	static FlatHashSet<uint32_t> incomingConnections_;
 	static RakNet::RakNetTime gracePeriod_;
 	static FlatHashMap<PlayerAddressHash, OmpPlayerEncryptionData> ompPlayers_;
+	static NetworkRole networkRole_;
 };

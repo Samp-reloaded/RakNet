@@ -4499,7 +4499,7 @@ namespace RakNet
 
 				rcs->requestsMade++;
 				rcs->nextRequestTime=timeMS+1000;
-				char c[3];
+				char c[3] = {};
 				c[0] = ID_OPEN_CONNECTION_REQUEST;
 				const unsigned short requestCookie = rcs->hasConnectionCookie
 					? static_cast<unsigned short>(rcs->connectionCookie ^ SAMPRakNet::SAMP_PETARDED)
