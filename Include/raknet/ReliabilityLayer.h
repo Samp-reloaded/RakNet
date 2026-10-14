@@ -18,6 +18,8 @@
 #ifndef __RELIABILITY_LAYER_H
 #define __RELIABILITY_LAYER_H
 
+#include <cstddef>
+
 #include "SocketLayer.h"
 #include "MTUSize.h"
 #include "DS_LinkedList.h"
@@ -135,6 +137,8 @@ namespace RakNet
 		/// Were you ever unable to deliver a packet despite retries?
 		/// \return true means the connection has been lost.  Otherwise not.
 		bool IsDeadConnection( void ) const;
+		// NOTSA: a client memory policy close is distinct from a missing ACK.
+		[[nodiscard]] bool HasLocalResourceLimitFailure() const { return localResourceLimitExceeded; }
 
 		/// Causes IsDeadConnection to return true
 		void KillConnection(void);
@@ -276,6 +280,9 @@ namespace RakNet
 		void CalculateHistogramAckSize(void);
 
 		DataStructures::List<DataStructures::LinkedList<InternalPacket*>*> orderingList;
+		std::size_t orderedPendingPackets{};
+		std::size_t orderedPendingBytes{};
+		bool localResourceLimitExceeded{};
 		DataStructures::Queue<InternalPacket*> outputQueue;
 		DataStructures::RangeList<MessageNumberType> acknowlegements;
 		RakNetTimeNS nextAckTime;

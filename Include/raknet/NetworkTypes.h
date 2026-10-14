@@ -116,6 +116,17 @@ namespace RakNet
 	/// Size of PlayerID data
 	#define PlayerID_Size 6
 
+	// NOTSA: local metadata, never serialized in a datagram.
+	enum class DisconnectOrigin : unsigned int
+	{
+		Unspecified,
+		RemoteNotification,
+		ReliableAckTimeout,
+		LocalRequest,
+		LocalAdmissionPolicy,
+		LocalResourceLimit,
+	};
+
 	/// This represents a user message from another system.
 	struct Packet
 	{
@@ -138,6 +149,12 @@ namespace RakNet
 		/// @internal
 		/// Indicates whether to delete the data, or to simply delete the packet.
 		bool deleteData;
+
+		[[nodiscard]] DisconnectOrigin GetDisconnectOrigin() const { return disconnectOrigin; }
+		void SetDisconnectOrigin(DisconnectOrigin origin) { disconnectOrigin = origin; }
+
+	private:
+		DisconnectOrigin disconnectOrigin;
 	};
 
 	class RakPeerInterface;

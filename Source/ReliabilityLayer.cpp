@@ -61,6 +61,11 @@ namespace
 	constexpr RakNet::SplitPacketIndexType MAX_SPLIT_PACKET_COUNT = 4096;
 	constexpr unsigned int MAX_SPLIT_PACKET_CHANNELS = 256;
 	constexpr std::size_t MAX_SPLIT_PACKET_DATA_BYTES = 4u * 1024u * 1024u;
+	// NOTSA: independent of server admission policy, bound expanded wire work and
+	// outstanding client ordered state. The wire message number remains 16 bits.
+	constexpr std::size_t MAX_EXPANDED_ACKS_PER_DATAGRAM = 65536;
+	constexpr std::size_t MAX_CLIENT_ORDERED_PACKETS = 4096;
+	constexpr std::size_t MAX_CLIENT_ORDERED_BYTES = 16u * 1024u * 1024u;
 
 	void LogSplitPacketIssue(
 		std::string_view reason,
@@ -231,6 +236,9 @@ void ReliabilityLayer::InitializeVariables( void )
 	// lastPacketSendTime=retransmittedFrames=sentPackets=sentFrames=receivedPacketsCount=bytesSent=bytesReceived=0;
 
 	deadConnection = cheater = false;
+	orderedPendingPackets = 0;
+	orderedPendingBytes = 0;
+	localResourceLimitExceeded = false;
 	lastAckTime = 0;
 
 	lowBandwidth = SAMPRakNet::GetMinimumSendBitsPerSecond();
@@ -329,6 +337,8 @@ void ReliabilityLayer::FreeThreadSafeMemory( void )
 	}
 
 	orderingList.Clear();
+	orderedPendingPackets = 0;
+	orderedPendingBytes = 0;
 
 	//resendList.ForEachData(DeleteInternalPacket);
 	resendList.Clear();
@@ -379,12 +389,14 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 {
 
 	RakAssert( !( length <= 0 || buffer == 0 ) );
+	shouldBanPeer = false;
 
 
 	if ( length <= 1 || buffer == 0 )   // Length of 1 is a connection request resend that we just ignore
 		return true;
 
-	shouldBanPeer = false;
+	if (localResourceLimitExceeded)
+		return true;
 	//int numberOfAcksInFrame = 0;
 	unsigned int acksLimit = 0;
 	unsigned int messageHoleLimit = 0;
@@ -422,14 +434,27 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 	acksLimit = SAMPRakNet::GetAcksLimit();
 	messageHoleLimit = SAMPRakNet::GetMessageHoleLimit();
 	messagesLimit = SAMPRakNet::GetMessagesLimit();
+	const bool enforceServerPolicy = !SAMPRakNet::IsClientRole();
 
 	DataStructures::RangeList<MessageNumberType> incomingAcks;
 	socketData.Read(hasAcks);
 	if (hasAcks)
 	{
-		MessageNumberType messageNumber;
 		if (incomingAcks.Deserialize(&socketData)==false)
 			return false;
+		// Validate the total before applying any ACK. Repeated/overlapping ranges
+		// must not multiply one small datagram into unbounded work.
+		std::size_t expandedAckCount = 0;
+		for (std::size_t rangeIndex = 0; rangeIndex < incomingAcks.ranges.Size(); ++rangeIndex)
+		{
+			const auto& range = incomingAcks.ranges[rangeIndex];
+			if (range.minIndex > range.maxIndex)
+				return false;
+			const std::size_t rangeSize = static_cast<std::size_t>(range.maxIndex) - range.minIndex + 1;
+			if (rangeSize > MAX_EXPANDED_ACKS_PER_DATAGRAM - expandedAckCount)
+				return false;
+			expandedAckCount += rangeSize;
+		}
 		for (i=0; i<incomingAcks.ranges.Size();i++)
 		{
 			if (incomingAcks.ranges[i].minIndex>incomingAcks.ranges[i].maxIndex)
@@ -440,7 +465,7 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 
 			statistics.acknowlegementsReceived += incomingAcks.ranges[i].maxIndex - incomingAcks.ranges[i].minIndex;
 
-			if (incomingAcks.ranges[i].maxIndex - incomingAcks.ranges[i].minIndex > messageHoleLimit)
+			if (enforceServerPolicy && incomingAcks.ranges[i].maxIndex - incomingAcks.ranges[i].minIndex > messageHoleLimit)
 			{
 				unsigned int receivedAcks = incomingAcks.ranges[i].maxIndex - incomingAcks.ranges[i].minIndex;
 				const char* ipPort = playerId.ToString(true);
@@ -451,7 +476,7 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 				return 1;
 			}
 
-			for (messageNumber=incomingAcks.ranges[i].minIndex; messageNumber >= incomingAcks.ranges[i].minIndex && messageNumber <= incomingAcks.ranges[i].maxIndex; messageNumber++)
+			for (std::size_t messageNumber = incomingAcks.ranges[i].minIndex; messageNumber <= incomingAcks.ranges[i].maxIndex; ++messageNumber)
 			{
 				hasAcks=true;
 
@@ -459,12 +484,12 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 
 				// SHOW - ack received
 				//printf("Got Ack for %i. resendList.Size()=%i sendQueue[0].Size() = %i\n",internalPacket->messageNumber, resendList.Size(), sendQueue[0].Size());
-				ackedHistogramCounter=RemovePacketFromResendListAndDeleteOlderReliableSequenced( messageNumber, time );
+				ackedHistogramCounter=RemovePacketFromResendListAndDeleteOlderReliableSequenced( static_cast<MessageNumberType>(messageNumber), time );
 
 #ifdef _DEBUG_LOGGER
 				{
 					char temp[256];
-					sprintf(temp, "%p: Got ack for %i. Resend queue size=%i\n", this, messageNumber, resendQueue.Size());
+					sprintf(temp, "%p: Got ack for %zu. Resend queue size=%i\n", this, messageNumber, resendQueue.Size());
 					OutputDebugStr(temp);
 				}
 #endif
@@ -492,7 +517,7 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 				statistics.perFrameAcksLimitCounter = 0;
 			}
 			
-			if (statistics.perSecondAcksLimitCounter > acksLimit)
+			if (enforceServerPolicy && statistics.perSecondAcksLimitCounter > acksLimit)
 			{
 				const char * ipPort = playerId.ToString(true);
 				if (auto* core = SAMPRakNet::GetCore())
@@ -635,13 +660,15 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 				statistics.perSecondMessagesLimitCounter = statistics.perFrameMessagesLimitCounter;
 				statistics.perFrameMessagesLimitCounter = 0;
 			}
-			if (statistics.perSecondMessagesLimitCounter > messagesLimit)
+			if (enforceServerPolicy && statistics.perSecondMessagesLimitCounter > messagesLimit)
 			{
 				const char* ipPort = playerId.ToString(true);
 				if (auto* core = SAMPRakNet::GetCore())
 					core->logLn(LogLevel::Warning, "client exceeded 'messageslimit' %s (%d) Limit: %d/sec", ipPort, statistics.perSecondMessagesLimitCounter, messagesLimit);
 				incomingAcks.Clear();
 				shouldBanPeer = true;
+				delete[] internalPacket->data;
+				internalPacketPool.ReleasePointer(internalPacket);
 				return 1;
 			}
 
@@ -837,7 +864,10 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 									*/
 
 									//printf("Pushing delayed packet %i with ordering index %i. outputQueue.Size()==%i\n", orderingListAtOrderingStream->Peek()->messageNumber, orderingListAtOrderingStream->Peek()->orderingIndex, outputQueue.Size() );
-									outputQueue.Push( orderingListAtOrderingStream->Pop() );
+									InternalPacket* readyPacket = orderingListAtOrderingStream->Pop();
+									--orderedPendingPackets;
+									orderedPendingBytes -= BITS_TO_BYTES(readyPacket->dataBitLength);
+									outputQueue.Push(readyPacket);
 									waitingForOrderedPacketReadIndex[ orderingChannelCopy ]++; // This wraps at 255
 									indexFound=true;
 								}
@@ -857,14 +887,26 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 				//	RakAssert(waitingForOrderedPacketReadIndex[ internalPacket->orderingChannel ] < internalPacket->orderingIndex);
 					statistics.orderedMessagesOutOfOrder++;
 
-					if (statistics.orderedMessagesOutOfOrder > messageHoleLimit)
+					if (enforceServerPolicy && statistics.orderedMessagesOutOfOrder > messageHoleLimit)
 					{
 						const char* ipPort = playerId.ToString(true);
 						if (auto* core = SAMPRakNet::GetCore())
 							core->logLn(LogLevel::Warning, "Too many out-of-order messages from player %s (%d) Limit: %u (messageholelimit)", ipPort, statistics.orderedMessagesOutOfOrder, messageHoleLimit);
 						incomingAcks.Clear();
 						shouldBanPeer = true;
+						delete[] internalPacket->data;
+						internalPacketPool.ReleasePointer(internalPacket);
 						return 1;
+					}
+					const std::size_t packetBytes = BITS_TO_BYTES(internalPacket->dataBitLength);
+					if (!enforceServerPolicy && (orderedPendingPackets >= MAX_CLIENT_ORDERED_PACKETS ||
+						packetBytes > MAX_CLIENT_ORDERED_BYTES - orderedPendingBytes))
+					{
+						delete[] internalPacket->data;
+						internalPacketPool.ReleasePointer(internalPacket);
+						localResourceLimitExceeded = true;
+						deadConnection = true;
+						return true;
 					}
 
 					// This is a newer ordered packet than we are waiting for. Store it for future use
@@ -2619,6 +2661,8 @@ void ReliabilityLayer::AddToOrderingList( InternalPacket * internalPacket )
 
 	theList->End();
 	theList->Add(internalPacket);
+	++orderedPendingPackets;
+	orderedPendingBytes += BITS_TO_BYTES(internalPacket->dataBitLength);
 }
 
 //-------------------------------------------------------------------------------------------------------

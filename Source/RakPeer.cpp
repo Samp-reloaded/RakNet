@@ -144,6 +144,7 @@ namespace RakNet
 		p->data = (unsigned char*)p + sizeof(Packet);
 		p->length = dataSize;
 		p->deleteData = false;
+		p->SetDisconnectOrigin(DisconnectOrigin::Unspecified);
 		return p;
 	}
 
@@ -153,6 +154,7 @@ namespace RakNet
 		p->data = data;
 		p->length = dataSize;
 		p->deleteData = true;
+		p->SetDisconnectOrigin(DisconnectOrigin::Unspecified);
 		return p;
 	}
 }
@@ -4304,7 +4306,7 @@ namespace RakNet
 				}
 			}
 
-			if (shouldBanPeer && playerId.binaryAddress != LOCALHOST && GetTime() > SAMPRakNet::GetGracePeriod())
+			if (!SAMPRakNet::IsClientRole() && shouldBanPeer && playerId.binaryAddress != LOCALHOST && GetTime() > SAMPRakNet::GetGracePeriod())
 			{
 				const char* playerIp = rakPeer->PlayerIDToDottedIP(playerId);
 				RakNetTime banTime = SAMPRakNet::GetNetworkLimitsBanTime();
@@ -4312,6 +4314,7 @@ namespace RakNet
 
 				Packet* packet = AllocPacket(sizeof(char));
 				packet->data[0] = ID_DISCONNECTION_NOTIFICATION;
+				packet->SetDisconnectOrigin(DisconnectOrigin::LocalAdmissionPolicy);
 				packet->bitSize = (sizeof(char)) * 8;
 				packet->playerId = playerId;
 				packet->playerIndex = (PlayerIndex)rakPeer->GetIndexFromPlayerID(playerId, true);
@@ -4653,6 +4656,14 @@ namespace RakNet
 							packet->data[ 0 ] = ID_CONNECTION_LOST; // DeadConnection
 						else
 							packet->data[ 0 ] = ID_DISCONNECTION_NOTIFICATION; // DeadConnection
+						packet->SetDisconnectOrigin(remoteSystem->reliabilityLayer.HasLocalResourceLimitFailure()
+							? DisconnectOrigin::LocalResourceLimit
+							: remoteSystem->connectMode == RemoteSystemStruct::DISCONNECT_ON_NO_ACK
+								? DisconnectOrigin::RemoteNotification
+								: remoteSystem->connectMode == RemoteSystemStruct::DISCONNECT_ASAP
+									? DisconnectOrigin::LocalRequest
+									: remoteSystem->connectMode == RemoteSystemStruct::CONNECTED
+										? DisconnectOrigin::ReliableAckTimeout : DisconnectOrigin::Unspecified);
 
 						//if (staticDataBytes)
 						//	memcpy( packet->data + sizeof( char ), remoteSystem->staticData.GetData(), staticDataBytes );
@@ -4691,6 +4702,7 @@ namespace RakNet
 				{
 					packet = AllocPacket(sizeof(char));
 					packet->data[0] = ID_CONNECTION_LOST; // DeadConnection
+					packet->SetDisconnectOrigin(DisconnectOrigin::LocalRequest);
 					packet->bitSize = (sizeof(char)) * 8;
 					packet->playerId = playerId;
 					packet->playerIndex = (PlayerIndex)remoteSystemIndex;
@@ -4705,7 +4717,8 @@ namespace RakNet
 				if ( remoteSystem->connectMode==RemoteSystemStruct::CONNECTED )
 				{
 					// Taken from SA-MP 0.3.7 changes
-					if (!remoteSystem->isLogon)
+					// The application logon receipt exists only on the server.
+					if (!SAMPRakNet::IsClientRole() && !remoteSystem->isLogon)
 					{
 						// Taken from SA-MP 0.3.7 changes
 						RakNetTime diff = RakNet::GetTime() - remoteSystem->connectionTime;
