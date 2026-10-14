@@ -28,6 +28,7 @@
 #include "RPCMap.h"
 #include "SimpleMutex.h"
 #include "DS_OrderedList.h"
+#include "ClientWireAdapter.h"
 
 #include "../../SAMPRakNet.hpp"
 
@@ -68,6 +69,18 @@ namespace RakNet
 
 		///Destructor
 		virtual ~RakPeer();
+		// NOTSA: per-peer SDK adapter; lifecycle calls happen with the worker stopped.
+		void SetClientWireAdapter(const ClientWireAdapter& adapter) { clientWireAdapter = adapter; }
+		void BeginClientWire(unsigned int address, unsigned short port) {
+			clientCookieMask = clientWireAdapter.Begin(address, port);
+		}
+		void EndClientWire() {
+			clientWireAdapter.End();
+			clientCookieMask = 0x6969u;
+		}
+		int DecodeClientDatagram(unsigned int address, unsigned short port, unsigned char* data, int length) {
+			return clientWireAdapter.Decode(address, port, data, length);
+		}
 
 		// --------------------------------------------------------------------------------------------Major Low Level Functions - Functions needed by most users--------------------------------------------------------------------------------------------
 		/// \brief Starts the network threads, opens the listen port.
@@ -760,6 +773,8 @@ namespace RakNet
 		int threadSleepTimer;
 
 		SOCKET connectionSocket;
+		ClientWireAdapter clientWireAdapter{}; // NOTSA: owned per peer, no global key registry.
+		unsigned short clientCookieMask{0x6969u}; // NOTSA: encoded protocol mask only.
 	#if defined (_WIN32) && defined(USE_WAIT_FOR_MULTIPLE_EVENTS)
 		WSAEVENT recvEvent;
 	#endif

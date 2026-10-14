@@ -48,8 +48,8 @@ bool RakClient::Connect( const char* host, unsigned short serverPort, unsigned s
 {
 	SAMPRakNet::SetClientRole();
 	RakPeer::Disconnect( 100 );
-	
-	RakPeer::Initialize( 1, clientPort, threadSleepTimer );
+	RakPeer::EndClientWire();
+	if (host == nullptr) return false;
 	
 	if ( host[ 0 ] < '0' || host[ 0 ] > '2' )
 	{
@@ -58,6 +58,13 @@ bool RakClient::Connect( const char* host, unsigned short serverPort, unsigned s
 #else
 		return false;
 #endif
+	}
+	// NOTSA: publish the exact endpoint before starting the receive worker.
+	if (host == nullptr) return false;
+	RakPeer::BeginClientWire(inet_addr(host), serverPort);
+	if (!RakPeer::Initialize(1, clientPort, threadSleepTimer)) {
+		RakPeer::EndClientWire();
+		return false;
 	}
 	
 	unsigned i;
@@ -70,12 +77,19 @@ bool RakClient::Connect( const char* host, unsigned short serverPort, unsigned s
 	}
 	
 	// ignore depreciated. A pointless variable
-	return RakPeer::Connect( host, serverPort, ( char* ) password.GetData(), password.GetNumberOfBytesUsed() );
+	const bool launched = RakPeer::Connect(host, serverPort,
+		reinterpret_cast<char*>(password.GetData()), password.GetNumberOfBytesUsed());
+	if (!launched) {
+		RakPeer::Disconnect(0);
+		RakPeer::EndClientWire();
+	}
+	return launched;
 }
 
 void RakClient::Disconnect( unsigned int blockDuration, unsigned char orderingChannel )
 {
 	RakPeer::Disconnect( blockDuration, orderingChannel );
+	RakPeer::EndClientWire();
 }
 
 void RakClient::InitializeSecurity( const char *privKeyP, const char *privKeyQ )

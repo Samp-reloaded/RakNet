@@ -23,6 +23,7 @@
 #include "RakPeerInterface.h"
 #include "BitStream.h"
 #include "RakNetStatistics.h" 
+#include "ClientWireAdapter.h"
 
 namespace RakNet
 {
@@ -35,6 +36,8 @@ namespace RakNet
 	public:
 		/// Destructor
 		virtual ~RakClientInterface() {}
+		// NOTSA: configure only with the native peer stopped.
+		virtual void SetClientWireAdapter(const ClientWireAdapter& adapter) = 0;
 
 		///Call this to connect the client to the specified host (ip or domain name) and server port.
 		/// This is a non-blocking connection.  You know the connection is successful when IsConnected() returns true

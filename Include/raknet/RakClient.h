@@ -42,6 +42,9 @@ namespace RakNet
 		
 		/// Destructor
 		virtual ~RakClient();
+		void SetClientWireAdapter(const ClientWireAdapter& adapter) override {
+			RakPeer::SetClientWireAdapter(adapter);
+		}
 
 		///Call this to connect the client to the specified host (ip or domain name) and server port.
 		/// This is a non-blocking connection.  You know the connection is successful when IsConnected() returns true

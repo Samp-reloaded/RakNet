@@ -4101,7 +4101,7 @@ namespace RakNet
 
 					unsigned char request[3];
 					request[0] = ID_OPEN_CONNECTION_REQUEST;
-					const unsigned short response = static_cast<unsigned short>(cookie ^ SAMPRakNet::SAMP_PETARDED);
+					const unsigned short response = static_cast<unsigned short>(cookie ^ rakPeer->clientCookieMask);
 					memcpy(request + 1, &response, sizeof(response));
 					for (i = 0; i < rakPeer->messageHandlerList.Size(); i++)
 						rakPeer->messageHandlerList[i]->OnDirectSocketSend((const char*)request, sizeof(request) * 8, playerId);
@@ -4502,7 +4502,7 @@ namespace RakNet
 				char c[3] = {};
 				c[0] = ID_OPEN_CONNECTION_REQUEST;
 				const unsigned short requestCookie = rcs->hasConnectionCookie
-					? static_cast<unsigned short>(rcs->connectionCookie ^ SAMPRakNet::SAMP_PETARDED)
+					? static_cast<unsigned short>(rcs->connectionCookie ^ clientCookieMask)
 					: 0;
 				// The server reads the two bytes after the packet id as the
 				// cookie response.  A zero value preserves the legacy first
@@ -4645,8 +4645,10 @@ namespace RakNet
 				// Ping this guy if it is time to do so
 				if ( remoteSystem->connectMode==RemoteSystemStruct::CONNECTED )
 				{
-					// Taken from SA-MP 0.3.7 changes
-					if (!remoteSystem->isLogon)
+					// isLogon is admitted by the server's LegacyNetwork PlayerConnect handler.
+					// A client peer never owns that server-side receipt; applying this watchdog
+					// there disconnects a healthy connection after 30 seconds, including InGame.
+					if (!SAMPRakNet::IsClientRole() && !remoteSystem->isLogon)
 					{
 						// Taken from SA-MP 0.3.7 changes
 						RakNetTime diff = RakNet::GetTime() - remoteSystem->connectionTime;

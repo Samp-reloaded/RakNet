@@ -419,9 +419,12 @@ int SocketLayer::RecvFrom( const SOCKET s, RakPeer *rakPeer, int *errorCode )
 
 		if (SAMPRakNet::IsClientRole())
 		{
-			// Legacy SA-MP servers send ordinary RakNet datagrams to clients.
-			// The client encoder is applied only on the outbound path.
-			ProcessNetworkPacket(sa.sin_addr.s_addr, portnum, data, len, rakPeer);
+			// NOTSA: decode OMP's offer/replies on the same socket before RakPeer dispatch.
+			const int decodedLength = rakPeer->DecodeClientDatagram(
+				sa.sin_addr.s_addr, portnum, reinterpret_cast<unsigned char*>(data), len);
+			if (decodedLength > 0 && decodedLength <= len) {
+				ProcessNetworkPacket(sa.sin_addr.s_addr, portnum, data, decodedLength, rakPeer);
+			}
 		}
 		else
 		{
