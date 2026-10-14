@@ -61,7 +61,7 @@ namespace
 	constexpr RakNet::SplitPacketIndexType MAX_SPLIT_PACKET_COUNT = 4096;
 	constexpr unsigned int MAX_SPLIT_PACKET_CHANNELS = 256;
 	constexpr std::size_t MAX_SPLIT_PACKET_DATA_BYTES = 4u * 1024u * 1024u;
-	// NOTSA: independent of server admission policy, bound expanded wire work and
+	// independent of server admission policy, bound expanded wire work and
 	// outstanding client ordered state. The wire message number remains 16 bits.
 	constexpr std::size_t MAX_EXPANDED_ACKS_PER_DATAGRAM = 65536;
 	constexpr std::size_t MAX_CLIENT_ORDERED_PACKETS = 4096;
@@ -437,7 +437,8 @@ bool ReliabilityLayer::HandleSocketReceiveFromConnectedPlayer( const char *buffe
 	const bool enforceServerPolicy = !SAMPRakNet::IsClientRole();
 
 	DataStructures::RangeList<MessageNumberType> incomingAcks;
-	socketData.Read(hasAcks);
+	if (!socketData.Read(hasAcks))
+		return false;
 	if (hasAcks)
 	{
 		if (incomingAcks.Deserialize(&socketData)==false)

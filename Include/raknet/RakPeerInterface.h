@@ -20,6 +20,7 @@
 
 #include "PacketPriority.h"
 #include "NetworkTypes.h"
+#include "ReceiveBudget.h"
 #include "Export.h"
 
 // Forward declarations
@@ -144,13 +145,15 @@ namespace RakNet
 		/// \return 0 if no packets are waiting to be handled, otherwise a pointer to a packet.
 		/// sa NetworkTypes.h contains struct Packet
 		virtual Packet* Receive( void )=0;
+		// bounded owner-lane work, including internal RPC/plugin packets.
+		[[nodiscard]] virtual ReceiveResult ReceiveBounded(ReceiveBudget& budget)=0;
 
 		/// Call this to deallocate a message returned by Receive() when you are done handling it.
 		/// \param[in] packet The message to deallocate.	
 		virtual void DeallocatePacket( Packet *packet )=0;
 
 		/// Return the total number of connections we are allowed
-		// TODO - rename for RakNet 3.0
+		// Legacy maximum-peer naming is retained by the public SDK.
 		virtual unsigned short GetMaximumNumberOfPeers( void ) const=0;
 
 		// --------------------------------------------------------------------------------------------Remote Procedure Call Functions - Functions to initialize and perform RPC--------------------------------------------------------------------------------------------
@@ -335,12 +338,12 @@ namespace RakNet
 		/// Returns an IP address at index 0 to GetNumberOfAddresses-1
 		virtual const char* GetLocalIP( unsigned int index )=0;
 
-		/// TODO - depreciate this
+		/// Legacy API.
 		/// Returns the dotted IP address for the specified playerId
 		/// \param[in] playerId Any player ID other than UNASSIGNED_PLAYER_ID, even if that player is not currently connected
 		virtual const char* PlayerIDToDottedIP( const PlayerID playerId ) const=0;
 
-		// TODO - depreciate this
+		// Legacy API.
 		/// Converts a dotted IP to a playerId
 		/// \param[in]  host Either a dotted IP address or a domain name
 		/// \param[in]  remotePort Which port to connect to on the remote machine.

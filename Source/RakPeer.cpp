@@ -45,6 +45,8 @@
 #include "RakSleep.h"
 #include "RouterInterface.h"
 #include "RakAssert.h"
+#include <limits>
+#include <memory>
 
 #if !defined ( __APPLE__ ) && !defined ( __APPLE_CC__ )
 #include <malloc.h>
@@ -140,21 +142,29 @@ namespace RakNet
 {
 	Packet *AllocPacket(unsigned dataSize)
 	{
-		Packet *p = (Packet *)malloc(sizeof(Packet) + dataSize);
+		Packet* p = static_cast<Packet*>(malloc(sizeof(Packet) + dataSize));
+		if (!p)
+			throw std::bad_alloc{};
+		std::uninitialized_value_construct_n(p, 1);
 		p->data = (unsigned char*)p + sizeof(Packet);
 		p->length = dataSize;
 		p->deleteData = false;
 		p->SetDisconnectOrigin(DisconnectOrigin::Unspecified);
+		p->ResetReceiveMetadata();
 		return p;
 	}
 
 	Packet *AllocPacket(unsigned dataSize, unsigned char *data)
 	{
-		Packet *p = (Packet *)malloc(sizeof(Packet));
+		Packet* p = static_cast<Packet*>(malloc(sizeof(Packet)));
+		if (!p)
+			throw std::bad_alloc{};
+		std::uninitialized_value_construct_n(p, 1);
 		p->data = data;
 		p->length = dataSize;
 		p->deleteData = true;
 		p->SetDisconnectOrigin(DisconnectOrigin::Unspecified);
+		p->ResetReceiveMetadata();
 		return p;
 	}
 }
@@ -786,6 +796,9 @@ void RakPeer::Disconnect( unsigned int blockDuration, unsigned char orderingChan
 	for (i=0; i < packetPool.Size(); i++)
 		DeallocatePacket(packetPool[i]);
 	packetPool.Clear();
+	while (!deferredTailPackets.IsEmpty())
+		DeallocatePacket(deferredTailPackets.Pop().packet);
+	transferredReceiveSequence = publishedReceiveSequence.load(std::memory_order_acquire);
 #ifdef _RAKNET_THREADSAFE
 	rakPeerMutexes[packetPool_Mutex].Unlock();
 #endif
@@ -960,18 +973,46 @@ bool RakPeer::Send( RakNet::BitStream const * bitStream, PacketPriority priority
 // --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 Packet* RakPeer::Receive( void )
 {
-	Packet *packet = ReceiveIgnoreRPC();
-	while (packet && (packet->data[ 0 ] == ID_RPC || (packet->length>sizeof(unsigned char)+sizeof(RakNetTime) && packet->data[0]==ID_TIMESTAMP && packet->data[sizeof(unsigned char)+sizeof(RakNetTime)]==ID_RPC)))
+	auto budget = ReceiveBudget::Unlimited();
+	return ReceiveInternal(budget, true).GetPacket();
+}
+
+// callbacks execute synchronously on the owner lane. Their execution
+// time is caller-defined; this ledger bounds SDK work and invocation counts.
+ReceiveResult RakPeer::ReceiveBounded(ReceiveBudget& budget)
+{
+	return ReceiveInternal(budget, true);
+}
+
+ReceiveResult RakPeer::ReceiveInternal(ReceiveBudget& budget, bool processRPC)
+{
+	if (receiveInProgress)
+		return ReceiveResult::Failed(ReceiveFailure::ReentrantReceive);
+	if (!budget.IsValid())
+		return ReceiveResult::Failed(ReceiveFailure::InvalidBudget);
+	receiveInProgress = true;
+	struct ReceiveScope
 	{
-		// Do RPC calls from the user thread, not the network update thread
-		// If we are currently blocking on an RPC reply, send ID_RPC to the blocker to handle rather than handling RPCs automatically
-		HandleRPCPacket( ( char* ) packet->data, packet->length, packet->playerId, packet->playerIndex );
-		DeallocatePacket( packet );
+		bool& inProgress;
+		~ReceiveScope() { inProgress = false; }
+	} scope{receiveInProgress};
 
-		packet = ReceiveIgnoreRPC();
+	while (true)
+	{
+		if (budget.compatibilityMode)
+			budget.pluginsUpdated = false;
+		auto result = ReceiveIgnoreRPCInternal(budget);
+		if (result.GetStatus() != ReceiveStatus::Packet || !processRPC)
+			return result;
+		Packet& packet = *result.GetPacket();
+		const std::size_t messageOffset = packet.data[0] == ID_TIMESTAMP ? 1 + sizeof(RakNetTime) : 0;
+		if (packet.data[messageOffset] != ID_RPC)
+			return result;
+		const auto releasePacket = [this](Packet* value) { DeallocatePacket(value); };
+		const std::unique_ptr<Packet, decltype(releasePacket)> owner{&packet, releasePacket};
+		if (!HandleRPCPacket(packet) && !budget.compatibilityMode)
+			return ReceiveResult::Failed(ReceiveFailure::MalformedPacket);
 	}
-
-    return packet;
 }
 
 // --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -982,96 +1023,149 @@ Packet* RakPeer::Receive( void )
 #endif
 Packet* RakPeer::ReceiveIgnoreRPC( void )
 {
-	if ( !( IsActive() ) )
-		return 0;
+	auto budget = ReceiveBudget::Unlimited();
+	return ReceiveInternal(budget, false).GetPacket();
+}
 
-	Packet *packet;
-	Packet **threadPacket;
-	PluginReceiveResult pluginResult;
-
-	int offset;
-	unsigned int i;
-
-	for (i=0; i < messageHandlerList.Size(); i++)
+ReceiveResult RakPeer::ReceiveIgnoreRPCInternal(ReceiveBudget& budget)
+{
+	if (!IsActive())
+		return ReceiveResult::Empty();
+	if (!budget.pluginsUpdated)
 	{
-		messageHandlerList[i]->Update(this);
+		const std::size_t pluginCount = messageHandlerList.Size();
+		if (pluginCount > budget.workLimit)
+			return ReceiveResult::Failed(ReceiveFailure::InvalidBudget);
+		if (!budget.CanChargeWork(pluginCount))
+			return ReceiveResult::Yield();
+		budget.pluginsUpdated = true;
+		budget.workUnits += pluginCount;
+		for (std::size_t index = 0; index < pluginCount && index < messageHandlerList.Size(); ++index)
+			messageHandlerList[index]->Update(this);
 	}
 
-	do 
+	while (IsActive())
 	{
 #ifdef _RAKNET_THREADSAFE
 		rakPeerMutexes[transferToPacketQueue_Mutex].Lock();
-#endif
-		// Take all the messages off the queue so if the user pushes them back they are really pushed back, and not just at the end of the immediate write
-		threadPacket=packetSingleProducerConsumer.ReadLock();
-		while (threadPacket)
-		{
-			packet=*threadPacket;
-			packetSingleProducerConsumer.ReadUnlock();
-			threadPacket=packetSingleProducerConsumer.ReadLock();
-			packetPool.Push(packet);
-		}
-#ifdef _RAKNET_THREADSAFE
-		rakPeerMutexes[transferToPacketQueue_Mutex].Unlock();
-#endif
-
-#ifdef _MSC_VER
-#pragma warning( disable : 4127 ) // warning C4127: conditional expression is constant
-#endif
-
-#ifdef _RAKNET_THREADSAFE
 		rakPeerMutexes[packetPool_Mutex].Lock();
 #endif
-		if (packetPool.Size()==0)
+		// Transfer one published head at a time. A tail pushback waits behind
+		// the exact producer watermark observed when it was pushed back.
+		if (packetPool.IsEmpty())
+		{
+			if (!budget.CanChargeWork(1))
+			{
+#ifdef _RAKNET_THREADSAFE
+				rakPeerMutexes[packetPool_Mutex].Unlock();
+				rakPeerMutexes[transferToPacketQueue_Mutex].Unlock();
+#endif
+				return ReceiveResult::Yield();
+			}
+			if (!deferredTailPackets.IsEmpty() && deferredTailPackets.Peek().producerWatermark <= transferredReceiveSequence)
+			{
+				packetPool.Push(deferredTailPackets.Pop().packet);
+				budget.ChargeTransfer();
+			}
+			else if (Packet** threadPacket = packetSingleProducerConsumer.ReadLock())
+			{
+				Packet* packet = *threadPacket;
+				transferredReceiveSequence = packet->receiveSequence;
+				packetSingleProducerConsumer.ReadUnlock();
+				packetPool.Push(packet);
+				budget.ChargeTransfer();
+			}
+		}
+		if (packetPool.IsEmpty())
 		{
 #ifdef _RAKNET_THREADSAFE
 			rakPeerMutexes[packetPool_Mutex].Unlock();
+			rakPeerMutexes[transferToPacketQueue_Mutex].Unlock();
 #endif
-			return 0;
+			return ReceiveResult::Empty();
 		}
-
-		packet = packetPool.Pop();
+		Packet* packet = packetPool.Peek();
+		const std::size_t packetWork = 1 + static_cast<std::size_t>(messageHandlerList.Size());
+		const bool oversized = packet->length > budget.byteLimit;
+		const bool invalidWorkBudget = packetWork > budget.workLimit;
+		if (oversized || invalidWorkBudget || !budget.CanAdmit(packet->length, packetWork))
+		{
+			const bool discardOversized = oversized && budget.CanChargeWork(1);
+			if (discardOversized)
+			{
+				packetPool.Pop();
+				++budget.workUnits;
+				++budget.discardedPackets;
+				const auto maximumCount = std::numeric_limits<std::size_t>::max();
+				budget.discardedBytes = packet->length > maximumCount - budget.discardedBytes
+					? maximumCount : budget.discardedBytes + packet->length;
+			}
+#ifdef _RAKNET_THREADSAFE
+			rakPeerMutexes[packetPool_Mutex].Unlock();
+			rakPeerMutexes[transferToPacketQueue_Mutex].Unlock();
+#endif
+			if (discardOversized)
+			{
+				DeallocatePacket(packet);
+				return ReceiveResult::Failed(ReceiveFailure::OversizedPacket);
+			}
+			return invalidWorkBudget ? ReceiveResult::Failed(ReceiveFailure::InvalidBudget) : ReceiveResult::Yield();
+		}
+		packetPool.Pop();
+		budget.ChargePacket(packet->length, packetWork);
 #ifdef _RAKNET_THREADSAFE
 		rakPeerMutexes[packetPool_Mutex].Unlock();
+		rakPeerMutexes[transferToPacketQueue_Mutex].Unlock();
 #endif
-		if ( ( packet->length >= sizeof(unsigned char) + sizeof( RakNetTime ) ) &&
-			( (unsigned char) packet->data[ 0 ] == ID_TIMESTAMP ) )
+		if (!packet->data || packet->length == 0 || packet->bitSize < 8 ||
+			packet->bitSize > static_cast<std::size_t>(packet->length) * 8 ||
+			packet->bitSize > static_cast<unsigned int>(std::numeric_limits<int>::max()))
 		{
-			offset = sizeof(unsigned char);
-			ShiftIncomingTimestamp( packet->data + offset, packet->playerId );
+			DeallocatePacket(packet);
+			return ReceiveResult::Failed(ReceiveFailure::MalformedPacket);
 		}
-		if ( (unsigned char) packet->data[ 0 ] == ID_RPC_REPLY )
+		std::size_t messageOffset = 0;
+		if (packet->data[0] == ID_TIMESTAMP)
 		{
-			HandleRPCReplyPacket( ( char* ) packet->data, packet->length, packet->playerId );
-			DeallocatePacket( packet );
-			packet=0; // Will do the loop again and get another packet
-		}
-		else
-		{
-			for (i=0; i < messageHandlerList.Size(); i++)
+			messageOffset = 1 + sizeof(RakNetTime);
+			if (packet->bitSize < (messageOffset + 1) * 8)
 			{
-				pluginResult=messageHandlerList[i]->OnReceive(this, packet);
-				if (pluginResult==RR_STOP_PROCESSING_AND_DEALLOCATE)
-				{
-					DeallocatePacket( packet );
-					packet=0; // Will do the loop again and get another packet
-					break; // break out of the enclosing for
-				}
-				else if (pluginResult==RR_STOP_PROCESSING)
-				{
-					packet=0;
-					break;
-				}
+				DeallocatePacket(packet);
+				return ReceiveResult::Failed(ReceiveFailure::MalformedPacket);
+			}
+			if (!packet->IsTimestampAdjusted())
+			{
+				ShiftIncomingTimestamp(packet->data + 1, packet->playerId);
+				packet->MarkTimestampAdjusted();
 			}
 		}
-
-	} while(packet==0);
-
-
-	RakAssert( packet->data );
-
-
-	return packet;
+		if (packet->data[messageOffset] == ID_RPC_REPLY)
+		{
+			HandleRPCReplyPacket(*packet);
+			DeallocatePacket(packet);
+			continue;
+		}
+		const std::size_t pluginCount = messageHandlerList.Size();
+		bool intercepted = false;
+		for (std::size_t index = 0; index < pluginCount && index < messageHandlerList.Size(); ++index)
+		{
+			const auto result = messageHandlerList[index]->OnReceive(this, packet);
+			if (result == RR_STOP_PROCESSING_AND_DEALLOCATE)
+			{
+				DeallocatePacket(packet);
+				intercepted = true;
+				break;
+			}
+			if (result == RR_STOP_PROCESSING)
+			{
+				intercepted = true; // The plugin owns the packet now.
+				break;
+			}
+		}
+		if (!intercepted)
+			return ReceiveResult::PacketReceived(*packet);
+	}
+	return ReceiveResult::Empty();
 }
 
 // --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1247,7 +1341,7 @@ bool RakPeer::RPC( RPCID  uniqueID, const char *data, unsigned int bitLength, Pa
 #endif
 	if (replyFromTarget && blockOnRPCReply==true)
 	{
-		// TODO - this should be fixed eventually
+		// Legacy receive behavior.
 		// Prevent a bug where function A calls B (blocking) which calls C back on the sender, which calls D, and C is blocking.
 		// blockOnRPCReply is a shared variable so making it unset would unset both blocks, rather than the lowest on the callstack
 		// Fix by tracking which function the reply is for.
@@ -1454,7 +1548,7 @@ bool RakPeer::RPC( RPCID  uniqueID, const char *data, unsigned int bitLength, Pa
 
 					if (strcmp(uniqueIdentifier, uniqueID)!=0)
 					{
-						HandleRPCPacket( ( char* ) p->data, p->length, p->playerId );
+						HandleRPCPacket(*p);
 						DeallocatePacket(p);
 					}
 					else
@@ -2476,7 +2570,7 @@ void RakPeer::PushBackPacket( Packet *packet, bool pushAtHead)
 	if (pushAtHead)
 		packetPool.PushAtHead(packet);
 	else
-		packetPool.Push(packet);
+		deferredTailPackets.Push({packet, publishedReceiveSequence.load(std::memory_order_acquire)});
 #ifdef _RAKNET_THREADSAFE
 	rakPeerMutexes[packetPool_Mutex].Unlock();
 #endif
@@ -3014,8 +3108,11 @@ RakNetTime RakPeer::GetBestClockDifferential( const PlayerID playerId ) const
 #ifdef _MSC_VER
 #pragma warning( disable : 4701 ) // warning C4701: local variable <variable name> may be used without having been initialized
 #endif
-bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, PlayerIndex playerIndex )
+bool RakPeer::HandleRPCPacket(const Packet& packet)
 {
+	const unsigned char* data = packet.data;
+	const PlayerID playerId = packet.playerId;
+	const PlayerIndex playerIndex = packet.playerIndex;
 	// RPC BitStream format is
 	// ID_RPC - unsigned char
 	// Unique identifier string length - unsigned char
@@ -3023,18 +3120,22 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 	// Number of bits of the data (int)
 	// The data
 
-	RakNet::BitStream incomingBitStream( (unsigned char *) data, length, false );
+	RakNet::BitStream incomingBitStream(packet.data, packet.length, false);
+	incomingBitStream.SetWriteOffset(static_cast<int>(packet.bitSize));
 #if RPCID_STRING
-	char uniqueIdentifier[ 256 ];
+	char uniqueIdentifier[256]{};
+	bool nameIsEncoded{};
 #else
-	RPCID uniqueIdentifier;
+	RPCID uniqueIdentifier{};
 #endif
-	unsigned char *userData;
-	bool networkIDIsEncoded;
-	RPCIndex rpcIndex;
-	RPCNode *node;
-	RPCParameters rpcParms;
-	NetworkID networkID;
+	bool networkIDIsEncoded{};
+	RPCIndex rpcIndex{};
+	RPCNode* node{};
+	RPCParameters rpcParms{};
+	NetworkID networkID{};
+#if !RAKNET_LEGACY
+	bool blockingCommand{};
+#endif
 	RakNet::BitStream replyToSender;
 	rpcParms.replyToSender=&replyToSender;
 
@@ -3051,7 +3152,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 	if ( incomingBitStream.Read( nameIsEncoded ) == false )
 	{
 
-		RakAssert( 0 ); // bitstream was not long enough.  Some kind of internal error
 
 		return false;
 	}
@@ -3061,7 +3161,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 		if ( stringCompressor->DecodeString(uniqueIdentifier, 256, &incomingBitStream) == false )
 		{
 
-			RakAssert( 0 ); // bitstream was not long enough.  Some kind of internal error
 
 			return false;
 		}
@@ -3073,7 +3172,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 		if ( incomingBitStream.ReadCompressed( rpcIndex ) == false )
 		{
 
-			RakAssert( 0 ); // bitstream was not long enough.  Some kind of internal error
 
 			return false;
 		}
@@ -3082,7 +3180,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 	if ( incomingBitStream.Read( uniqueIdentifier ) == false )
 	{
 
-		RakAssert( 0 ); // bitstream was not long enough.  Some kind of internal error
 
 		return false;
 	}
@@ -3093,7 +3190,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 	if ( incomingBitStream.Read( blockingCommand ) == false )
 	{
 
-		RakAssert( 0 ); // bitstream was not long enough.  Some kind of internal error
 
 		return false;
 	}
@@ -3103,7 +3199,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 	if ( incomingBitStream.Read( rpcParms.hasTimestamp ) == false )
 	{
 
-		RakAssert( 0 ); // bitstream was not long enough.  Some kind of internal error
 
 		return false;
 	}
@@ -3112,7 +3207,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 	if ( incomingBitStream.ReadCompressed( rpcParms.numberOfBitsOfData ) == false )
 	{
 
-		RakAssert( 0 ); // bitstream was not long enough.  Some kind of internal error
 
 		return false;
 	}
@@ -3124,7 +3218,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 	if ( incomingBitStream.Read( networkIDIsEncoded ) == false )
 	{
 
-		RakAssert( 0 ); // bitstream was not long enough.  Some kind of internal error
 
 		return false;
 	}
@@ -3134,7 +3227,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 		if ( incomingBitStream.Read( networkID ) == false )
 		{
 
-			RakAssert( 0 ); // bitstream was not long enough.  Some kind of internal error
 
 			return false;
 		}
@@ -3144,7 +3236,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 	if (rpcIndex==UNDEFINED_RPC_INDEX)
 	{
 		// Unregistered function
-		RakAssert(0);
 		return false;
 	}
 
@@ -3152,7 +3243,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 	if (node==0)
 	{
 
-		RakAssert( 0 ); // Should never happen except perhaps from threading errors?  No harm in checking anyway
 
 		return false;
 	}
@@ -3163,7 +3253,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 		// If this hits then this pointer was registered as a class member function but the packet does not have an NetworkID.
 		// Most likely this means this system registered a function with REGISTER_CLASS_MEMBER_RPC and the remote system called it
 		// using the unique ID for a function registered with REGISTER_STATIC_RPC.
-		RakAssert(0);
 		return false;
 	}
 
@@ -3172,7 +3261,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 		// If this hits then this pointer was not registered as a class member function but the packet does have an NetworkID.
 		// Most likely this means this system registered a function with REGISTER_STATIC_RPC and the remote system called it
 		// using the unique ID for a function registered with REGISTER_CLASS_MEMBER_RPC.
-		RakAssert(0);
 		return false;
 	}
 
@@ -3207,38 +3295,23 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 	}
 	else
 	{
-		if ( incomingBitStream.GetNumberOfUnreadBits() == 0 )
+		if (rpcParms.numberOfBitsOfData > incomingBitStream.GetNumberOfUnreadBits())
 		{
 
-			RakAssert( 0 );
 
-			return false; // No data was appended!
+			return false; // Advertised payload is outside the logical bit extent.
 		}
 
 		// We have to copy into a new data chunk because the user data might not be byte aligned.
-		bool usedAlloca=false;
-#if !defined(_COMPATIBILITY_1)
-		if (BITS_TO_BYTES( incomingBitStream.GetNumberOfUnreadBits() ) < MAX_ALLOCA_STACK_ALLOCATION)
-		{
-			userData = ( unsigned char* ) alloca( BITS_TO_BYTES( incomingBitStream.GetNumberOfUnreadBits() ) );
-			usedAlloca=true;
-		}
-		else
-#endif
-			userData = new unsigned char[BITS_TO_BYTES(incomingBitStream.GetNumberOfUnreadBits())];
+		const auto userData = std::make_unique<unsigned char[]>(BITS_TO_BYTES(rpcParms.numberOfBitsOfData));
 
 
 		// The false means read out the internal representation of the bitstream data rather than
 		// aligning it as we normally would with user data.  This is so the end user can cast the data received
 		// into a bitstream for reading
-		if ( incomingBitStream.ReadBits( ( unsigned char* ) userData, rpcParms.numberOfBitsOfData, false ) == false )
+		if (!incomingBitStream.ReadBits(userData.get(), rpcParms.numberOfBitsOfData, false))
 		{
 
-			//RakAssert( 0 );
-
-			#if defined(_COMPATIBILITY_1)
-			delete [] userData;
-			#endif
 
 			return false; // Not enough data to read
 		}
@@ -3247,7 +3320,7 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 //			ShiftIncomingTimestamp( userData, playerId );
 
 		// Call the function callback
-		rpcParms.input=userData;
+		rpcParms.input=userData.get();
 #if !RAKNET_LEGACY
 		if (networkIDIsEncoded)
 		{
@@ -3262,8 +3335,6 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 		}
 
 
-		if (usedAlloca==false)
-			delete [] userData;
 	}
 
 #if !RAKNET_LEGACY
@@ -3271,7 +3342,7 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 	{
 		RakNet::BitStream reply;
 		reply.Write((unsigned char) ID_RPC_REPLY);
-		reply.Write((char*)replyToSender.GetData(), replyToSender.GetNumberOfBytesUsed());
+		reply.WriteBits(replyToSender.GetData(), replyToSender.GetNumberOfBitsUsed(), false);
 		Send(&reply, HIGH_PRIORITY, RELIABLE, 0, playerId, false);
 	}
 #endif
@@ -3290,14 +3361,16 @@ bool RakPeer::HandleRPCPacket( const char *data, int length, PlayerID playerId, 
 * \return true on success, false on a bad packet or an unregistered function
 */
 // --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-void RakPeer::HandleRPCReplyPacket( const char *data, int length, PlayerID playerId )
+void RakPeer::HandleRPCReplyPacket(const Packet& packet)
 {
+	const PlayerID playerId = packet.playerId;
 	if (blockOnRPCReply)
 	{
 		if ((playerId==replyFromTargetPlayer && replyFromTargetBroadcast==false) ||
 			(playerId!=replyFromTargetPlayer && replyFromTargetBroadcast==true))
 		{
-			replyFromTargetBS->Write(data+1, length-1);
+			const std::size_t payloadOffset = packet.data[0] == ID_TIMESTAMP ? 2 + sizeof(RakNetTime) : 1;
+			replyFromTargetBS->WriteBits(packet.data + payloadOffset, packet.bitSize - static_cast<unsigned int>(payloadOffset * 8), false);
 			blockOnRPCReply=false;
 		}
 	}
@@ -3920,8 +3993,10 @@ void RakPeer::ClearRequestedConnectionList(void)
 }
 inline void RakPeer::AddPacketToProducer(Packet *p)
 {
+	p->receiveSequence = ++nextReceiveSequence;
 	Packet **packetPtr=packetSingleProducerConsumer.WriteLock();
 	*packetPtr=p;
+	publishedReceiveSequence.store(nextReceiveSequence, std::memory_order_release);
 	packetSingleProducerConsumer.WriteUnlock();
 }
 // --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -4373,7 +4448,7 @@ namespace RakNet
 	#endif
 				}
 			}
-			// UNCONNECTED MESSAGE Pong with no data.  TODO - Problem - this matches a reliable send of other random data.
+			// UNCONNECTED MESSAGE Pong with no data.  This can also match a reliable send of other data.
 			else if ((unsigned char) data[ 0 ] == ID_PONG && length >= sizeof(unsigned char)+sizeof(RakNetTime) && length < sizeof(unsigned char)+sizeof(RakNetTime)+MAX_OFFLINE_DATA_LENGTH)
 			{
 				packet=AllocPacket(length);

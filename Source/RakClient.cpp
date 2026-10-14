@@ -145,12 +145,33 @@ bool RakClient::Send( RakNet::BitStream * bitStream, PacketPriority priority, Pa
 Packet* RakClient::Receive( void )
 {
 	Packet * packet = RakPeer::Receive();
+	return packet ? ProcessClientPacket(*packet).GetPacket() : nullptr;
+}
+
+// client control interception uses the same ledger as RPC/plugin work.
+ReceiveResult RakClient::ReceiveBounded(ReceiveBudget& budget)
+{
+	while (true)
+	{
+		auto result = RakPeer::ReceiveBounded(budget);
+		if (result.GetStatus() != ReceiveStatus::Packet)
+			return result;
+		result = ProcessClientPacket(*result.GetPacket());
+		if (result.GetStatus() != ReceiveStatus::Empty)
+			return result;
+	}
+}
+
+ReceiveResult RakClient::ProcessClientPacket(Packet& receivedPacket)
+{
+	Packet* packet = &receivedPacket;
 	
 	// Intercept specific client / server feature packets
 	
 	if ( packet )
 	{
 		RakNet::BitStream bitStream( packet->data, packet->length, false );
+		bitStream.SetWriteOffset(static_cast<int>(packet->bitSize));
 		int i;
 		
 		if ( packet->data[ 0 ] == ID_CONNECTION_REQUEST_ACCEPTED )
@@ -163,12 +184,16 @@ Packet* RakClient::Receive( void )
 			unsigned int token;
 
 			RakNet::BitStream inBitStream(packet->data, packet->length, false);
+			inBitStream.SetWriteOffset(static_cast<int>(packet->bitSize));
 			inBitStream.IgnoreBits(8); // ID_CONNECTION_REQUEST_ACCEPTED
 			//inBitStream.IgnoreBits(8 * sizeof(unsigned short)); //inBitStream.Read(remotePort);
 			inBitStream.IgnoreBits(8 * sizeof(unsigned int)); //inBitStream.Read(externalID.binaryAddress);
 			inBitStream.IgnoreBits(8 * sizeof(unsigned short)); //inBitStream.Read(externalID.port);			
-			inBitStream.Read(playerIndex);
-			inBitStream.Read(token);
+			if (!inBitStream.Read(playerIndex) || !inBitStream.Read(token))
+			{
+				DeallocatePacket(packet);
+				return ReceiveResult::Failed(ReceiveFailure::MalformedPacket);
+			}
 
 			localPlayerIndex = playerIndex;
 			packet->playerIndex = playerIndex;
@@ -180,13 +205,11 @@ Packet* RakClient::Receive( void )
 				packet->data[ 0 ] == ID_REMOTE_CONNECTION_LOST )
 		{
 			bitStream.IgnoreBits( 8 ); // Ignore identifier
-			bitStream.Read( packet->playerId.binaryAddress );
-			bitStream.Read( packet->playerId.port );
-			
-			if ( bitStream.Read( ( unsigned short& ) packet->playerIndex ) == false )
+			if (!bitStream.Read(packet->playerId.binaryAddress) || !bitStream.Read(packet->playerId.port) ||
+				!bitStream.Read(packet->playerIndex))
 			{
 				DeallocatePacket( packet );
-				return 0;
+				return ReceiveResult::Failed(ReceiveFailure::MalformedPacket);
 			}
 			
 			
@@ -202,9 +225,12 @@ Packet* RakClient::Receive( void )
 		else if ( packet->data[ 0 ] == ID_REMOTE_STATIC_DATA )
 		{
 			bitStream.IgnoreBits( 8 ); // Ignore identifier
-			bitStream.Read( packet->playerId.binaryAddress );
-			bitStream.Read( packet->playerId.port );
-			bitStream.Read( packet->playerIndex ); // ADDED BY KURI 
+			if (!bitStream.Read(packet->playerId.binaryAddress) || !bitStream.Read(packet->playerId.port) ||
+				!bitStream.Read(packet->playerIndex))
+			{
+				DeallocatePacket(packet);
+				return ReceiveResult::Failed(ReceiveFailure::MalformedPacket);
+			}
 			
 			i = GetOtherClientIndexByPlayerID( packet->playerId );
 			
@@ -217,7 +243,7 @@ Packet* RakClient::Receive( void )
 				otherClients[ i ].isActive = true;
 				otherClients[ i ].staticData.Reset();
 				// The static data is what is left over in the stream
-				otherClients[ i ].staticData.Write( ( char* ) bitStream.GetData() + BITS_TO_BYTES( bitStream.GetReadOffset() ), bitStream.GetNumberOfBytesUsed() - BITS_TO_BYTES( bitStream.GetReadOffset() ) );
+				otherClients[i].staticData.WriteBits(bitStream.GetData() + BITS_TO_BYTES(bitStream.GetReadOffset()), bitStream.GetNumberOfUnreadBits(), false);
 			}
 		}
 		else if ( packet->data[ 0 ] == ID_BROADCAST_PINGS )
@@ -232,12 +258,22 @@ Packet* RakClient::Receive( void )
 				if ( bitStream.Read( playerId.binaryAddress ) == false )
 					break; // No remaining data!
 					
-				bitStream.Read( playerId.port );
+				if (!bitStream.Read(playerId.port))
+				{
+					DeallocatePacket(packet);
+					return ReceiveResult::Failed(ReceiveFailure::MalformedPacket);
+				}
 				
 				index = GetOtherClientIndexByPlayerID( playerId );
 				
+				short ping{};
+				if (!bitStream.Read(ping))
+				{
+					DeallocatePacket(packet);
+					return ReceiveResult::Failed(ReceiveFailure::MalformedPacket);
+				}
 				if ( index >= 0 )
-					bitStream.Read( otherClients[ index ].ping );
+					otherClients[index].ping = ping;
 				else
 				{
 					index = GetFreeOtherClientIndex();
@@ -245,53 +281,58 @@ Packet* RakClient::Receive( void )
 					if ( index >= 0 )
 					{
 						otherClients[ index ].isActive = true;
-						bitStream.Read( otherClients[ index ].ping );
+						otherClients[index].ping = ping;
 						otherClients[ index ].playerId = playerId;
 						otherClients[ index ].staticData.Reset();
 					}
 					
-					else
-						bitStream.IgnoreBits( sizeof( short ) * 8 );
 				}
 			}
 			
 			DeallocatePacket( packet );
-			return 0;
+			return ReceiveResult::Empty();
 		}
         else
 		if ( packet->data[ 0 ] == ID_TIMESTAMP &&
-			packet->length == sizeof(unsigned char)+sizeof(unsigned int)+sizeof(unsigned char)+sizeof(unsigned int)+sizeof(unsigned int) )
+			packet->bitSize == 8 * (sizeof(unsigned char)+sizeof(RakNetTime)+sizeof(unsigned char)+sizeof(unsigned int)+sizeof(unsigned int)) )
 		{
 			
 
 			RakNet::BitStream inBitStream(packet->data, packet->length, false);
+			inBitStream.SetWriteOffset(static_cast<int>(packet->bitSize));
 		
 			RakNetTime timeStamp;
 			unsigned char typeId;
 			unsigned int in_seed;
 			unsigned int in_nextSeed;
 			inBitStream.IgnoreBits(8); // ID_TIMESTAMP
-			inBitStream.Read(timeStamp);
-			inBitStream.Read(typeId); // ID_SET_RANDOM_NUMBER_SEED ?
+			if (!inBitStream.Read(timeStamp) || !inBitStream.Read(typeId))
+			{
+				DeallocatePacket(packet);
+				return ReceiveResult::Failed(ReceiveFailure::MalformedPacket);
+			}
 
 			// Check to see if this is a user TIMESTAMP message which
 			// accidentally has length SetRandomNumberSeedStruct_Size
 			if ( typeId != ID_SET_RANDOM_NUMBER_SEED )
-				return packet;
+				return ReceiveResult::PacketReceived(*packet);
 
-			inBitStream.Read(in_seed);
-			inBitStream.Read(in_nextSeed);
+			if (!inBitStream.Read(in_seed) || !inBitStream.Read(in_nextSeed))
+			{
+				DeallocatePacket(packet);
+				return ReceiveResult::Failed(ReceiveFailure::MalformedPacket);
+			}
 			
 			seed = in_seed;
 			nextSeed = in_nextSeed;
 			nextSeedUpdate = timeStamp + 9000; // Seeds are updated every 9 seconds
 			
 			DeallocatePacket( packet );
-			return 0;
+			return ReceiveResult::Empty();
 		}
 	}
 	
-	return packet;
+	return ReceiveResult::PacketReceived(*packet);
 }
 
 void RakClient::DeallocatePacket( Packet *packet )

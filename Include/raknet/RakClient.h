@@ -103,6 +103,7 @@ namespace RakNet
 		/// \return 0 if no packets are waiting to be handled, otherwise a pointer to a packet.
 		// sa CoreNetworkStructures.h contains struct Packet
 		Packet* Receive( void ) override;
+		[[nodiscard]] ReceiveResult ReceiveBounded(ReceiveBudget& budget) override;
 		
 		/// Call this to deallocate a packet returned by Receive when you are done handling it.
 		/// \param[in] packet The packet to deallocate.	
@@ -398,6 +399,7 @@ namespace RakNet
 		PlayerIndex GetPlayerIndex( void ) override;
 		
 	private:
+		ReceiveResult ProcessClientPacket(Packet& packet);
 
 		
 		int GetOtherClientIndexByPlayerID( const PlayerID playerId );

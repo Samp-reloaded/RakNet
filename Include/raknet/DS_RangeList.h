@@ -94,15 +94,20 @@ namespace RakNet
 		bool RangeList<range_type>::Deserialize(RakNet::BitStream *out)
 		{
 			ranges.Clear();
-			unsigned short count;
-			out->ReadCompressed(count);
-			unsigned short i;
-			range_type min,max;
-			bool maxEqualToMin;
+			unsigned short count{};
+			if (!out->ReadCompressed(count))
+				return false;
+			// Every range requires at least its equality flag and minimum index.
+			if (static_cast<unsigned int>(count) > out->GetNumberOfUnreadBits() / (1 + sizeof(range_type) * 8))
+				return false;
+			unsigned int i{};
+			range_type min{}, max{};
+			bool maxEqualToMin{};
 
 			for (i=0; i < count; i++)
 			{
-				out->Read(maxEqualToMin);
+				if (!out->Read(maxEqualToMin))
+					return false;
 				if (out->Read(min)==false)
 					return false;
 				if (maxEqualToMin==false)

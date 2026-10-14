@@ -19,6 +19,7 @@
 #define __RAK_CLIENT_INTERFACE_H
 
 #include "NetworkTypes.h"
+#include "ReceiveBudget.h"
 #include "ClientWireAdapter.h"
 #include "PacketPriority.h"
 #include "RakPeerInterface.h"
@@ -98,6 +99,7 @@ namespace RakNet
 		/// \return 0 if no packets are waiting to be handled, otherwise a pointer to a packet.
 		// sa CoreNetworkStructures.h contains struct Packet
 		virtual Packet* Receive( void )=0;
+		[[nodiscard]] virtual ReceiveResult ReceiveBounded(ReceiveBudget& budget)=0;
 
 		/// Call this to deallocate a packet returned by Receive when you are done handling it.
 		/// \param[in] packet The packet to deallocate.	

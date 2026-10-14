@@ -18,6 +18,9 @@
 #ifndef __RAK_PEER_H
 #define __RAK_PEER_H
 
+#include <atomic>
+#include <cstdint>
+
 #include "Export.h"
 #include "ClientWireAdapter.h"
 #include "RakPeerInterface.h"
@@ -178,6 +181,7 @@ namespace RakNet
 		/// \return 0 if no packets are waiting to be handled, otherwise a pointer to a packet.
 		/// sa NetworkTypes.h contains struct Packet
 		Packet* Receive( void ) override;
+		[[nodiscard]] ReceiveResult ReceiveBounded(ReceiveBudget& budget) override;
 
 		/// Call this to deallocate a message returned by Receive() when you are done handling it.
 		/// \param[in] packet The message to deallocate.	
@@ -368,12 +372,12 @@ namespace RakNet
 		/// Returns an IP address at index 0 to GetNumberOfAddresses-1
 		const char* GetLocalIP( unsigned int index ) override;
 
-		/// TODO - depreciate this
+		/// Legacy API.
 		/// Returns the dotted IP address for the specified playerId
 		/// \param[in] playerId Any player ID other than UNASSIGNED_PLAYER_ID, even if that player is not currently connected
 		const char* PlayerIDToDottedIP( const PlayerID playerId ) const override;
 
-		// TODO - depreciate this
+		// Legacy API.
 		/// Converts a dotted IP to a playerId
 		/// \param[in]  host Either a dotted IP address or a domain name
 		/// \param[in]  remotePort Which port to connect to on the remote machine.
@@ -546,6 +550,8 @@ namespace RakNet
 
 		// This is done to provide custom RPC handling when in a blocking RPC
 		Packet* ReceiveIgnoreRPC( void );
+		ReceiveResult ReceiveInternal(ReceiveBudget& budget, bool processRPC);
+		ReceiveResult ReceiveIgnoreRPCInternal(ReceiveBudget& budget);
 
 		int GetIndexFromPlayerID( const PlayerID playerId, bool calledFromNetworkThread );
 
@@ -574,17 +580,13 @@ namespace RakNet
 
 		//void PushPortRefused( const PlayerID target );
 		///Handles an RPC packet.  This is sending an RPC request
-		/// \param[in] data A packet returned from Receive with the ID ID_RPC
-		/// \param[in] length The size of the packet data 
-		/// \param[in] playerId The sender of the packet 
+		/// \param[in] packet RPC envelope with its authoritative logical bit size.
 		/// \return true on success, false on a bad packet or an unregistered function
-		bool HandleRPCPacket( const char *data, int length, PlayerID playerId, PlayerIndex playerIndex );
+		bool HandleRPCPacket(const Packet& packet);
 
 		///Handles an RPC reply packet.  This is data returned from an RPC call
-		/// \param[in] data A packet returned from Receive with the ID ID_RPC
-		/// \param[in] length The size of the packet data 
-		/// \param[in] playerId The sender of the packet 
-		void HandleRPCReplyPacket( const char *data, int length, PlayerID playerId );
+		/// \param[in] packet Reply envelope with its authoritative logical bit size.
+		void HandleRPCReplyPacket(const Packet& packet);
 
 	#ifdef __USE_IO_COMPLETION_PORTS
 
@@ -809,6 +811,16 @@ namespace RakNet
 		DataStructures::SingleProducerConsumer<Packet*> packetSingleProducerConsumer;
 		//DataStructures::Queue<Packet*> pushedBackPacket, outOfOrderDeallocatedPacket;
 		DataStructures::Queue<Packet*> packetPool;
+		struct DeferredTailPacket
+		{
+			Packet* packet{};
+			std::uint64_t producerWatermark{};
+		};
+		DataStructures::Queue<DeferredTailPacket> deferredTailPackets;
+		std::atomic<std::uint64_t> publishedReceiveSequence{};
+		std::uint64_t nextReceiveSequence{};
+		std::uint64_t transferredReceiveSequence{};
+		bool receiveInProgress{};
 
 	private:
 		void EndClientWire() noexcept;

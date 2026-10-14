@@ -137,7 +137,7 @@ namespace RakNet
 		/// Were you ever unable to deliver a packet despite retries?
 		/// \return true means the connection has been lost.  Otherwise not.
 		bool IsDeadConnection( void ) const;
-		// NOTSA: a client memory policy close is distinct from a missing ACK.
+		// a client memory policy close is distinct from a missing ACK.
 		[[nodiscard]] bool HasLocalResourceLimitFailure() const { return localResourceLimitExceeded; }
 
 		/// Causes IsDeadConnection to return true

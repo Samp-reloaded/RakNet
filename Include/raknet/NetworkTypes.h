@@ -18,6 +18,8 @@
 #ifndef __NETWORK_TYPES_H
 #define __NETWORK_TYPES_H
 
+#include <cstdint>
+
 #include "RakNetDefines.h"
 #include "Export.h"
 
@@ -116,7 +118,7 @@ namespace RakNet
 	/// Size of PlayerID data
 	#define PlayerID_Size 6
 
-	// NOTSA: local metadata, never serialized in a datagram.
+	// Local metadata, never serialized in a datagram.
 	enum class DisconnectOrigin : unsigned int
 	{
 		Unspecified,
@@ -152,9 +154,15 @@ namespace RakNet
 
 		[[nodiscard]] DisconnectOrigin GetDisconnectOrigin() const { return disconnectOrigin; }
 		void SetDisconnectOrigin(DisconnectOrigin origin) { disconnectOrigin = origin; }
+		[[nodiscard]] bool IsTimestampAdjusted() const { return timestampAdjusted; }
+		void MarkTimestampAdjusted() { timestampAdjusted = true; }
+		void ResetReceiveMetadata() { timestampAdjusted = false; receiveSequence = 0; }
 
 	private:
-		DisconnectOrigin disconnectOrigin;
+		friend class RakPeer;
+		DisconnectOrigin disconnectOrigin{DisconnectOrigin::Unspecified};
+		bool timestampAdjusted{};
+		std::uint64_t receiveSequence{};
 	};
 
 	class RakPeerInterface;
@@ -175,7 +183,7 @@ namespace RakNet
 		/// Which instance of RakPeer (or a derived RakServer or RakClient) got this call
 		RakPeerInterface *recipient;
 
-		// TODO - RakNet 3.0. Be consistent and have user put ID_TIMESTAMP, rather than do this
+		// Legacy timestamp encoding is retained by the public SDK.
 		// Bug: hasTimestamp was unused.
 		// bool hasTimestamp;
 
