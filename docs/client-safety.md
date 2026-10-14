@@ -40,7 +40,8 @@ ledger cannot admit more work. Neither establishes remote disconnect.
 
 `GetFailure()` distinguishes `InvalidBudget`, `OversizedPacket`,
 `MalformedPacket`, and `ReentrantReceive`; other statuses report `None`.
-Zero capacities or a plugin chain larger than the full work budget are invalid.
+Zero capacities or a work budget unable to fit mandatory plugin updates plus
+one packet's plugin chain are invalid (`2 * plugin count + 1` minimum).
 A packet larger than the full byte capacity is removed and released with
 `OversizedPacket`, so a fresh valid ledger cannot yield forever on that head.
 The caller should treat a failure as a terminal admission error for its slice.
@@ -105,3 +106,24 @@ executed here. They require the actual SDK target and an owner-lane harness.
 | Timestamped raw packet returned, pushed back, returned again | Same shifted timestamp, unchanged logical bit count |
 | 7-bit RPC payload in a final storage byte | Callback reports 7 bits; an advertised eighth bit outside the packet extent is rejected |
 | Plugin `Update` or RPC callback calls receive recursively | Reentry failure/null; no younger dispatch and no new ledger |
+| One plugin, fresh `{1,1024,2}` budget every slice | `InvalidBudget`, rather than yielding forever on one head |
+| Plugin changes a one-byte packet to `ID_TIMESTAMP` | Postcallback extent validation rejects before inner-ID access |
+| 103 logical bits stored in 13 bytes for native accept | Reject before native connected state, encryption changes, or accept publication; valid accept remains exactly 104 bits |
+| Truncated compressed RPC mapping index | Reject without using an uninitialized index or changing the map |
+
+## Cross-thread queue publication
+
+The SDK SPSC queue uses atomic slot states (`Free`, `WriteReserved`,
+`Published`) and atomic next links. Payload initialization precedes
+release-publication of `Published`; `ReadLock()` acquires that exact state
+before returning the object or reading its pointee. `ReadUnlock()` captures its
+successor before releasing `Free`; `WriteLock()` acquires `Free` before reuse.
+The receive watermark alone is not used as the packet publication barrier.
+
+Both endpoints keep their own cursors. Every producer reservation keeps one free
+sentinel after the outstanding reserved/published span, so read lookahead cannot
+lap earlier read locks. Growth only changes an acquired free node's link; owned
+`unique_ptr` pointees remain stable when the producer's owner vector grows.
+Canceled write reservations are reset through the old reservation tail. No node
+is deleted until both endpoints are quiescent for clear or destruction. Size
+observations use atomic counters and remain unsuitable as FIFO barriers.

@@ -18,333 +18,199 @@
 #ifndef __SINGLE_PRODUCER_CONSUMER_H
 #define __SINGLE_PRODUCER_CONSUMER_H
 
-#include <assert.h>
-
-static const int MINIMUM_LIST_SIZE=8;
+#include <atomic>
+#include <cstddef>
+#include <limits>
+#include <memory>
+#include <utility>
+#include <vector>
 
 #include "Export.h"
+#include "RakAssert.h"
 
-namespace RakNet
+namespace RakNet::DataStructures
 {
-	/// The namespace DataStructures was only added to avoid compiler errors for commonly named data structures
-	/// As these data structures are stand-alone, you can use them outside of RakNet for your own projects if you wish.
-	namespace DataStructures
+	// Cursors belong exclusively to their endpoint. Only slot state, links and
+	// observation counters cross threads; no node is deleted while either runs.
+	template <class SingleProducerConsumerType>
+	class RAK_DLL_EXPORT SingleProducerConsumer
 	{
-		/// \brief A single producer consumer implementation without critical sections.
-		template <class SingleProducerConsumerType>
-		class RAK_DLL_EXPORT SingleProducerConsumer
+	public:
+		SingleProducerConsumer();
+		~SingleProducerConsumer() = default;
+		SingleProducerConsumer(const SingleProducerConsumer&) = delete;
+		SingleProducerConsumer& operator=(const SingleProducerConsumer&) = delete;
+
+		// Locks may be taken ahead, then unlocked in their original FIFO order.
+		[[nodiscard]] SingleProducerConsumerType* WriteLock();
+		void CancelWriteLock(SingleProducerConsumerType* cancelToLocation);
+		void WriteUnlock();
+		[[nodiscard]] SingleProducerConsumerType* ReadLock();
+		void CancelReadLock(SingleProducerConsumerType* cancelToLocation);
+		void ReadUnlock();
+
+		// Both endpoints must be quiescent for Clear and destruction.
+		void Clear();
+		// Legacy int boundary, saturated; observation only, never a queue barrier.
+		[[nodiscard]] int Size() const;
+		[[nodiscard]] bool CheckReadUnlockOrder(const SingleProducerConsumerType* data) const;
+		[[nodiscard]] bool ReadIsLocked() const;
+
+	private:
+		enum class SlotState : unsigned int { Free, WriteReserved, Published };
+		struct DataPlusPtr
 		{
-		public:
-			/// Constructor
-			SingleProducerConsumer();
-
-			/// Destructor
-			~SingleProducerConsumer();
-
-			/// WriteLock must be immediately followed by WriteUnlock.  These two functions must be called in the same thread.
-			/// \return A pointer to a block of data you can write to.
-			SingleProducerConsumerType* WriteLock(void);
-
-			/// Call if you don't want to write to a block of data from WriteLock() after all.
-			/// Cancelling locks cancels all locks back up to the data passed.  So if you lock twice and cancel using the first lock, the second lock is ignored
-			/// \param[in] cancelToLocation Which WriteLock() to cancel.
-			void CancelWriteLock(SingleProducerConsumerType* cancelToLocation);
-
-			/// Call when you are done writing to a block of memory returned by WriteLock()
-			void WriteUnlock(void);
-
-			/// ReadLock must be immediately followed by ReadUnlock. These two functions must be called in the same thread.
-			/// \retval 0 No data is availble to read
-			/// \retval Non-zero The data previously written to, in another thread, by WriteLock followed by WriteUnlock.
-			SingleProducerConsumerType* ReadLock(void);
-
-			// Cancelling locks cancels all locks back up to the data passed.  So if you lock twice and cancel using the first lock, the second lock is ignored
-			/// param[in] Which ReadLock() to cancel.
-			void CancelReadLock(SingleProducerConsumerType* cancelToLocation);
-
-			/// Signals that we are done reading the the data from the least recent call of ReadLock.
-			/// At this point that pointer is no longer valid, and should no longer be read.
-			void ReadUnlock(void);
-
-			/// Clear is not thread-safe and none of the lock or unlock functions should be called while it is running.
-			void Clear(void);
-
-			/// This function will estimate how many elements are waiting to be read.  It's threadsafe enough that the value returned is stable, but not threadsafe enough to give accurate results.
-			/// \return An ESTIMATE of how many data elements are waiting to be read
-			int Size(void) const;
-
-			/// Make sure that the pointer we done reading for the call to ReadUnlock is the right pointer.
-			/// param[in] A previous pointer returned by ReadLock()
-			bool CheckReadUnlockOrder(const SingleProducerConsumerType* data) const;
-
-			/// Returns if ReadUnlock was called before ReadLock
-			/// \return If the read is locked
-			bool ReadIsLocked(void) const;
-
-		private:
-			struct DataPlusPtr
-			{
-				DataPlusPtr() { readyToRead = false; }
-				SingleProducerConsumerType object;
-
-				// Ready to read is so we can use an equality boolean comparison, in case the writePointer var is trashed while context switching.
-				volatile bool readyToRead;
-				volatile DataPlusPtr *next;
-			};
-			volatile DataPlusPtr *readAheadPointer;
-			volatile DataPlusPtr *writeAheadPointer;
-			volatile DataPlusPtr *readPointer;
-			volatile DataPlusPtr *writePointer;
-			unsigned readCount, writeCount;
+			SingleProducerConsumerType object{};
+			std::atomic<SlotState> state{SlotState::Free};
+			std::atomic<DataPlusPtr*> next{};
 		};
+		static constexpr std::size_t MinimumListSize = 8;
+		std::vector<std::unique_ptr<DataPlusPtr>> ownedNodes;
+		DataPlusPtr* readAheadPointer{};
+		DataPlusPtr* writeAheadPointer{};
+		DataPlusPtr* readPointer{};
+		DataPlusPtr* writePointer{};
+		std::atomic<std::size_t> readCount{};
+		std::atomic<std::size_t> writeCount{};
+	};
 
-		template <class SingleProducerConsumerType>
-			SingleProducerConsumer<SingleProducerConsumerType>::SingleProducerConsumer()
+	template <class T>
+	SingleProducerConsumer<T>::SingleProducerConsumer()
+	{
+		ownedNodes.reserve(MinimumListSize);
+		for (std::size_t index = 0; index < MinimumListSize; ++index)
+			ownedNodes.push_back(std::make_unique<DataPlusPtr>());
+		Clear();
+	}
+
+	template <class T>
+	T* SingleProducerConsumer<T>::WriteLock()
+	{
+		DataPlusPtr* slot = writeAheadPointer;
+		// Acquire the consumer's release before reusing its object storage.
+		const auto state = slot->state.load(std::memory_order_acquire);
+		RakAssert(state == SlotState::Free);
+		static_cast<void>(state);
+		DataPlusPtr* next = slot->next.load(std::memory_order_acquire);
+		if (next->state.load(std::memory_order_acquire) != SlotState::Free)
 		{
-			// Preallocate
-			readPointer = new DataPlusPtr;
-			writePointer=readPointer;
-			readPointer->next = new DataPlusPtr;
-			int listSize;
-#ifdef _DEBUG
-			RakAssert(MINIMUM_LIST_SIZE>=3);
-#endif
-			for (listSize=2; listSize < MINIMUM_LIST_SIZE; listSize++)
-			{
-				readPointer=readPointer->next;
-				readPointer->next = new DataPlusPtr;
-			}
-			readPointer->next->next=writePointer; // last to next = start
-			readPointer=writePointer;
-			readAheadPointer=readPointer;
-			writeAheadPointer=writePointer;
-			readCount=writeCount=0;
+			// Keep one free sentinel after all write reservations. Growth never
+			// changes a published/read-locked node, and pointees never relocate.
+			auto inserted = std::make_unique<DataPlusPtr>();
+			inserted->next.store(next, std::memory_order_relaxed);
+			DataPlusPtr* insertedSlot = inserted.get();
+			ownedNodes.push_back(std::move(inserted));
+			slot->next.store(insertedSlot, std::memory_order_release);
+			next = insertedSlot;
 		}
+		slot->state.store(SlotState::WriteReserved, std::memory_order_relaxed);
+		writeAheadPointer = next;
+		return &slot->object;
+	}
 
-		template <class SingleProducerConsumerType>
-			SingleProducerConsumer<SingleProducerConsumerType>::~SingleProducerConsumer()
+	template <class T>
+	void SingleProducerConsumer<T>::CancelWriteLock(T* cancelToLocation)
+	{
+		DataPlusPtr* canceled = writePointer;
+		while (canceled != writeAheadPointer && &canceled->object != cancelToLocation)
+			canceled = canceled->next.load(std::memory_order_relaxed);
+		RakAssert(canceled != writeAheadPointer);
+		if (canceled == writeAheadPointer)
+			return;
+		DataPlusPtr* slot = canceled;
+		while (slot != writeAheadPointer)
 		{
-			volatile DataPlusPtr *next;
-			readPointer=writeAheadPointer->next;
-			while (readPointer!=writeAheadPointer)
-			{
-				next=readPointer->next;
-				delete (char*) readPointer;
-				readPointer=next;
-			}
-			delete (char*) readPointer;
+			slot->state.store(SlotState::Free, std::memory_order_relaxed);
+			slot = slot->next.load(std::memory_order_relaxed);
 		}
+		writeAheadPointer = canceled;
+	}
 
-		template <class SingleProducerConsumerType>
-			SingleProducerConsumerType* SingleProducerConsumer<SingleProducerConsumerType>::WriteLock( void )
+	template <class T>
+	void SingleProducerConsumer<T>::WriteUnlock()
+	{
+		DataPlusPtr* slot = writePointer;
+		RakAssert(slot != writeAheadPointer);
+		RakAssert(slot->state.load(std::memory_order_relaxed) == SlotState::WriteReserved);
+		DataPlusPtr* next = slot->next.load(std::memory_order_relaxed);
+		writeCount.fetch_add(1, std::memory_order_relaxed);
+		// This publishes the payload, its pointee initialization and next link.
+		slot->state.store(SlotState::Published, std::memory_order_release);
+		writePointer = next;
+	}
+
+	template <class T>
+	T* SingleProducerConsumer<T>::ReadLock()
+	{
+		DataPlusPtr* slot = readAheadPointer;
+		if (slot->state.load(std::memory_order_acquire) != SlotState::Published)
+			return nullptr;
+		// The publication acquire precedes every object/pointee and link read.
+		readAheadPointer = slot->next.load(std::memory_order_acquire);
+		return &slot->object;
+	}
+
+	template <class T>
+	void SingleProducerConsumer<T>::CancelReadLock(T* cancelToLocation)
+	{
+		DataPlusPtr* canceled = readPointer;
+		while (canceled != readAheadPointer && &canceled->object != cancelToLocation)
+			canceled = canceled->next.load(std::memory_order_relaxed);
+		RakAssert(canceled != readAheadPointer);
+		if (canceled != readAheadPointer)
+			readAheadPointer = canceled;
+	}
+
+	template <class T>
+	void SingleProducerConsumer<T>::ReadUnlock()
+	{
+		DataPlusPtr* slot = readPointer;
+		RakAssert(slot != readAheadPointer);
+		RakAssert(slot->state.load(std::memory_order_relaxed) == SlotState::Published);
+		// Capture the link and advance BEFORE the producer may reuse this node.
+		readPointer = slot->next.load(std::memory_order_acquire);
+		readCount.fetch_add(1, std::memory_order_release);
+		slot->state.store(SlotState::Free, std::memory_order_release);
+	}
+
+	template <class T>
+	void SingleProducerConsumer<T>::Clear()
+	{
+		ownedNodes.resize(MinimumListSize);
+		for (std::size_t index = 0; index < MinimumListSize; ++index)
 		{
-			if (writeAheadPointer->next==readPointer ||
-				writeAheadPointer->next->readyToRead==true)
-			{
-				volatile DataPlusPtr *originalNext=writeAheadPointer->next;
-				writeAheadPointer->next=new DataPlusPtr;
-				RakAssert(writeAheadPointer->next);
-				writeAheadPointer->next->next=originalNext;
-			}
-
-			volatile DataPlusPtr *last;
-			last=writeAheadPointer;
-			writeAheadPointer=writeAheadPointer->next;
-
-			return (SingleProducerConsumerType*) last;
+			ownedNodes[index]->state.store(SlotState::Free, std::memory_order_relaxed);
+			ownedNodes[index]->next.store(ownedNodes[(index + 1) % MinimumListSize].get(), std::memory_order_relaxed);
 		}
+		readPointer = ownedNodes.front().get();
+		writePointer = readPointer;
+		readAheadPointer = readPointer;
+		writeAheadPointer = readPointer;
+		readCount.store(0, std::memory_order_relaxed);
+		writeCount.store(0, std::memory_order_relaxed);
+	}
 
-		template <class SingleProducerConsumerType>
-			void SingleProducerConsumer<SingleProducerConsumerType>::CancelWriteLock( SingleProducerConsumerType* cancelToLocation )
-		{
-			writeAheadPointer=(DataPlusPtr *)cancelToLocation;
-		}
+	template <class T>
+	int SingleProducerConsumer<T>::Size() const
+	{
+		const auto consumed = readCount.load(std::memory_order_acquire);
+		const auto published = writeCount.load(std::memory_order_relaxed);
+		const auto count = published - consumed;
+		constexpr auto maximum = static_cast<std::size_t>(std::numeric_limits<int>::max());
+		return static_cast<int>(count > maximum ? maximum : count);
+	}
 
-		template <class SingleProducerConsumerType>
-			void SingleProducerConsumer<SingleProducerConsumerType>::WriteUnlock( void )
-		{
-			//	DataPlusPtr *dataContainer = (DataPlusPtr *)structure;
+	template <class T>
+	bool SingleProducerConsumer<T>::CheckReadUnlockOrder(const T* data) const
+	{
+		return &readPointer->object == data;
+	}
 
-#ifdef _DEBUG
-			RakAssert(writePointer->next!=readPointer);
-			RakAssert(writePointer!=writeAheadPointer);
-#endif
-
-			writeCount++;
-			// User is done with the data, allow send by updating the write pointer
-			writePointer->readyToRead=true;
-			writePointer=writePointer->next;
-		}
-
-		template <class SingleProducerConsumerType>
-			SingleProducerConsumerType* SingleProducerConsumer<SingleProducerConsumerType>::ReadLock( void )
-		{
-				if (readAheadPointer==writePointer ||
-					readAheadPointer->readyToRead==false)
-				{
-					return 0;
-				}
-
-				volatile DataPlusPtr *last;
-				last=readAheadPointer;
-				readAheadPointer=readAheadPointer->next;
-				return (SingleProducerConsumerType*)last;
-		}
-
-		template <class SingleProducerConsumerType>
-			void SingleProducerConsumer<SingleProducerConsumerType>::CancelReadLock( SingleProducerConsumerType* cancelToLocation )
-		{
-#ifdef _DEBUG
-			RakAssert(readPointer!=writePointer);
-#endif
-			readAheadPointer=(DataPlusPtr *)cancelToLocation;
-		}
-
-		template <class SingleProducerConsumerType>
-			void SingleProducerConsumer<SingleProducerConsumerType>::ReadUnlock( void )
-		{
-#ifdef _DEBUG
-			RakAssert(readAheadPointer!=readPointer); // If hits, then called ReadUnlock before ReadLock
-			RakAssert(readPointer!=writePointer); // If hits, then called ReadUnlock when Read returns 0
-#endif
-			readCount++;
-
-			// Allow writes to this memory block
-			readPointer->readyToRead=false;
-			readPointer=readPointer->next;
-		}
-
-		template <class SingleProducerConsumerType>
-			void SingleProducerConsumer<SingleProducerConsumerType>::Clear( void )
-		{
-			// Shrink the list down to MINIMUM_LIST_SIZE elements
-			volatile DataPlusPtr *next;
-			writePointer=readPointer->next;
-
-			int listSize=1;
-			next=readPointer->next;
-			while (next!=readPointer)
-			{
-				listSize++;
-				next=next->next;
-			}
-
-			while (listSize-- > MINIMUM_LIST_SIZE)
-			{
-				next=writePointer->next;
-#ifdef _DEBUG
-				RakAssert(writePointer!=readPointer);
-#endif
-				delete (char*) writePointer;
-				writePointer=next;
-			}
-
-			readPointer->next=writePointer;
-			writePointer=readPointer;
-			readAheadPointer=readPointer;
-			writeAheadPointer=writePointer;
-			readCount=writeCount=0;
-		}
-
-		template <class SingleProducerConsumerType>
-			int SingleProducerConsumer<SingleProducerConsumerType>::Size( void ) const
-		{
-			return writeCount-readCount;
-		}
-
-		template <class SingleProducerConsumerType>
-			bool SingleProducerConsumer<SingleProducerConsumerType>::CheckReadUnlockOrder(const SingleProducerConsumerType* data) const
-		{
-			return const_cast<const SingleProducerConsumerType *>(&readPointer->object) == data;
-		}
-
-
-		template <class SingleProducerConsumerType>
-			bool SingleProducerConsumer<SingleProducerConsumerType>::ReadIsLocked(void) const
-		{
-			return readAheadPointer!=readPointer;
-		}	
+	template <class T>
+	bool SingleProducerConsumer<T>::ReadIsLocked() const
+	{
+		return readAheadPointer != readPointer;
 	}
 }
 
 #endif
-
-/*
-#include "SingleProducerConsumer.h"
-#include <process.h>
-#include <assert.h>
-#include <stdio.h>
-#include <windows.h>
-#include <math.h>
-#include <stdlib.h>
-
-#define READ_COUNT_ITERATIONS 10000000
-
-DataStructures::SingleProducerConsumer<unsigned long> spc;
-unsigned long readCount;
-
-unsigned __stdcall ProducerThread( LPVOID arguments )
-{
-unsigned long producerCount;
-unsigned long *writeBlock;
-producerCount=0;
-while (readCount < READ_COUNT_ITERATIONS)
-{
-writeBlock=spc.WriteLock();
-*writeBlock=producerCount;
-spc.WriteUnlock();
-producerCount++;
-if ((producerCount%1000000)==0)
-{
-printf("WriteCount: %i. BufferSize=%i\n", producerCount, spc.Size());
-}
-}
-printf("PRODUCER THREAD ENDED!\n");
-return 0;
-}
-
-unsigned __stdcall ConsumerThread( LPVOID arguments )
-{
-unsigned long *readBlock;
-while (readCount < READ_COUNT_ITERATIONS)
-{
-if ((readBlock=spc.ReadLock())!=0)
-{
-if (*readBlock!=readCount)
-{
-printf("Test failed! Expected %i got %i!\n", readCount, *readBlock);
-readCount = READ_COUNT_ITERATIONS;
-RakAssert(0);
-}
-spc.ReadUnlock();
-readCount++;
-if ((readCount%1000000)==0)
-{
-printf("ReadCount:  %i. BufferSize=%i\n", readCount, spc.Size());
-}
-}
-}
-printf("CONSUMER THREAD ENDED!\n");
-return 0;
-}
-
-void main(void)
-{
-readCount=0;
-unsigned threadId1 = 0;
-unsigned threadId2 = 0;
-HANDLE thread1Handle, thread2Handle;
-unsigned long startTime = timeGetTime();
-
-thread1Handle=(HANDLE)_beginthreadex( NULL, 0, ProducerThread, 0, 0, &threadId1 );
-thread2Handle=(HANDLE)_beginthreadex( NULL, 0, ConsumerThread, 0, 0, &threadId1 );
-
-while (readCount < READ_COUNT_ITERATIONS)
-{
-Sleep(0);
-}
-char str[256];
-printf("Elapsed time = %i milliseconds. Press Enter to continue\n", timeGetTime() - startTime);
-gets(str);
-}
-*/

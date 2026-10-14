@@ -138,6 +138,50 @@ static const int MAX_OFFLINE_DATA_LENGTH=400; // I set this because I limit ID_C
 
 //#define _TEST_AES
 
+namespace
+{
+	bool HasValidPacketExtent(const Packet& packet)
+	{
+		if (!packet.data || packet.length == 0 || packet.bitSize < 8 ||
+			packet.bitSize > static_cast<std::size_t>(packet.length) * 8 ||
+			packet.bitSize > static_cast<unsigned int>(std::numeric_limits<int>::max()))
+			return false;
+		return packet.data[0] != ID_TIMESTAMP || packet.bitSize >= (2 + sizeof(RakNetTime)) * 8;
+	}
+
+	bool HasValidNativeControlExtent(unsigned char identifier, int bits)
+	{
+		if (bits < 8)
+			return false;
+		switch (identifier)
+		{
+		case ID_CONNECTION_REQUEST_ACCEPTED:
+			return bits == 8 * (1 + sizeof(unsigned int) + sizeof(unsigned short) + sizeof(PlayerIndex) + sizeof(unsigned int));
+		case ID_NEW_INCOMING_CONNECTION:
+			return bits == 8 * (1 + sizeof(unsigned int) + sizeof(unsigned short));
+		case ID_CONNECTED_PONG:
+			return bits == 8 * (1 + sizeof(RakNetTime) * 2);
+		case ID_INTERNAL_PING:
+			return bits == 8 * (1 + sizeof(RakNetTime));
+		case ID_DISCONNECTION_NOTIFICATION:
+		case ID_REQUEST_STATIC_DATA:
+		case ID_DETECT_LOST_CONNECTIONS:
+			return bits == 8;
+		case ID_CONNECTION_REQUEST:
+		case ID_AUTH_KEY:
+			return bits % 8 == 0; // These controls carry byte-counted text.
+#if !defined(_COMPATIBILITY_1)
+		case ID_SECURED_CONNECTION_RESPONSE:
+			return bits == 8 * (1 + sizeof(big::u32) + sizeof(RSA_BIT_SIZE) + 20);
+		case ID_SECURED_CONNECTION_CONFIRMATION:
+			return bits == 8 * (1 + 20 + sizeof(RSA_BIT_SIZE));
+#endif
+		default:
+			return true;
+		}
+	}
+}
+
 namespace RakNet
 {
 	Packet *AllocPacket(unsigned dataSize)
@@ -1034,7 +1078,9 @@ ReceiveResult RakPeer::ReceiveIgnoreRPCInternal(ReceiveBudget& budget)
 	if (!budget.pluginsUpdated)
 	{
 		const std::size_t pluginCount = messageHandlerList.Size();
-		if (pluginCount > budget.workLimit)
+		// A fresh ledger must fit mandatory Update plus one packet's plugin
+		// chain. A prior slice can already have transferred the head.
+		if (pluginCount > (budget.workLimit - 1) / 2)
 			return ReceiveResult::Failed(ReceiveFailure::InvalidBudget);
 		if (!budget.CanChargeWork(pluginCount))
 			return ReceiveResult::Yield();
@@ -1117,9 +1163,7 @@ ReceiveResult RakPeer::ReceiveIgnoreRPCInternal(ReceiveBudget& budget)
 		rakPeerMutexes[packetPool_Mutex].Unlock();
 		rakPeerMutexes[transferToPacketQueue_Mutex].Unlock();
 #endif
-		if (!packet->data || packet->length == 0 || packet->bitSize < 8 ||
-			packet->bitSize > static_cast<std::size_t>(packet->length) * 8 ||
-			packet->bitSize > static_cast<unsigned int>(std::numeric_limits<int>::max()))
+		if (!HasValidPacketExtent(*packet))
 		{
 			DeallocatePacket(packet);
 			return ReceiveResult::Failed(ReceiveFailure::MalformedPacket);
@@ -1163,7 +1207,16 @@ ReceiveResult RakPeer::ReceiveIgnoreRPCInternal(ReceiveBudget& budget)
 			}
 		}
 		if (!intercepted)
+		{
+			// Plugins have mutable packet access; classify only after checking
+			// their resulting pointer, storage and logical envelope again.
+			if (!HasValidPacketExtent(*packet))
+			{
+				DeallocatePacket(packet);
+				return ReceiveResult::Failed(ReceiveFailure::MalformedPacket);
+			}
 			return ReceiveResult::PacketReceived(*packet);
+		}
 	}
 	return ReceiveResult::Empty();
 }
@@ -4830,7 +4883,7 @@ namespace RakNet
 						// Since we are decompressing input, we need to copy to a bitstream, decompress, then copy back to a probably
 						// larger data block.  It's slow, but the user should have known that anyway
 						dataBitStream.Reset();
-						dataBitStream.WriteAlignedBytes( ( unsigned char* ) data, BITS_TO_BYTES( bitSize ) );
+						dataBitStream.WriteBits(data, static_cast<unsigned int>(bitSize), false);
 						rawBytesReceived += dataBitStream.GetNumberOfBytesUsed();
 
 	//					numberOfBytesUsed = dataBitStream.GetNumberOfBytesUsed();
@@ -4856,13 +4909,24 @@ namespace RakNet
 								data = new unsigned char [ byteSize ];
 							}
 							memcpy( data, dataBitStream.GetData(), byteSize );
+							bitSize = static_cast<int>(dataBitStream.GetNumberOfBitsUsed());
 						}
 						else
-							byteSize=0;
+						{
+							byteSize = 0;
+							bitSize = 0;
+						}
 					}
 					else
 						// Fast and easy - just use the data that was returned
 						byteSize = BITS_TO_BYTES( bitSize );
+
+					if (!data || bitSize < 8 || !HasValidNativeControlExtent(data[0], bitSize))
+					{
+						delete[] data;
+						bitSize = remoteSystem->reliabilityLayer.Receive(&data);
+						continue;
+					}
 
 					// For unknown senders we only accept a few specific packets
 					if (remoteSystem->connectMode==RemoteSystemStruct::UNVERIFIED_SENDER)
@@ -5028,18 +5092,25 @@ namespace RakNet
 						else if ( (unsigned char) data[ 0 ] == ID_RPC_MAPPING )
 						{
 							RakNet::BitStream inBitStream( (unsigned char *) data, byteSize, false );
-							RPCIndex index;
+							inBitStream.SetWriteOffset(bitSize);
+							RPCIndex index{};
 							inBitStream.IgnoreBits(8);
 	#if RPCID_STRING
-							char output[256];
-							stringCompressor->DecodeString(output, 255, &inBitStream);
+							char output[256]{};
+							const bool validIdentifier = stringCompressor->DecodeString(output, 255, &inBitStream) && output[0] != '\0';
+	#else
+							const bool validIdentifier = true;
 	#endif
-							inBitStream.ReadCompressed(index);
+							if (validIdentifier && inBitStream.ReadCompressed(index) && index != UNDEFINED_RPC_INDEX)
+							{
 	#if !RPCID_STRING
-							RPCID output;
-							output = (RPCID)index;
+								const RPCID output = static_cast<RPCID>(index);
+								if (output != 0)
+									remoteSystem->rpcMap.AddIdentifierAtIndex(output, index);
+	#else
+								remoteSystem->rpcMap.AddIdentifierAtIndex(output, index);
 	#endif
-							remoteSystem->rpcMap.AddIdentifierAtIndex((RPCID)output, index);
+							}
 
 							if (data)
 								delete [] data;
@@ -5052,7 +5123,7 @@ namespace RakNet
 						else if ( (unsigned char) data[ 0 ] == ID_RECEIVED_STATIC_DATA )
 						{
 							remoteSystem->staticData.Reset();
-							remoteSystem->staticData.Write( ( char* ) data + sizeof(unsigned char), byteSize - 1 );
+							remoteSystem->staticData.WriteBits(data + 1, static_cast<unsigned int>(bitSize - 8), false);
 
 							// Inform game server code that we got static data
 							packet=AllocPacket(byteSize, data);
@@ -5151,17 +5222,21 @@ namespace RakNet
 
 							if ( allowConnection )
 							{
-								PlayerID externalID;
-								PlayerIndex playerIndex;
-								unsigned int token;
+								PlayerID externalID{};
+								PlayerIndex playerIndex{};
+								unsigned int token{};
 
 								RakNet::BitStream inBitStream((unsigned char *) data, byteSize, false);
+								inBitStream.SetWriteOffset(bitSize);
 								inBitStream.IgnoreBits(8); // ID_CONNECTION_REQUEST_ACCEPTED
 							//	inBitStream.Read(remotePort);
-								inBitStream.Read(externalID.binaryAddress);
-								inBitStream.Read(externalID.port);
-								inBitStream.Read(playerIndex);
-								inBitStream.Read(token);
+								if (!inBitStream.Read(externalID.binaryAddress) || !inBitStream.Read(externalID.port) ||
+									!inBitStream.Read(playerIndex) || !inBitStream.Read(token))
+								{
+									delete[] data;
+									bitSize = remoteSystem->reliabilityLayer.Receive(&data);
+									continue;
+								}
 
 								// Find a free remote system struct to use
 								//						RakNet::BitStream casBitS(data, byteSize, false);
@@ -5204,7 +5279,7 @@ namespace RakNet
 
 								// Send the connection request complete to the game
 								packet=AllocPacket(byteSize, data);
-								packet->bitSize = byteSize * 8;
+								packet->bitSize = bitSize;
 								packet->playerId = playerId;
 								packet->playerIndex = ( PlayerIndex ) GetIndexFromPlayerID( playerId, true );
 								AddPacketToProducer(packet);
