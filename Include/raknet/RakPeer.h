@@ -19,6 +19,7 @@
 #define __RAK_PEER_H
 
 #include "Export.h"
+#include "ClientWireAdapter.h"
 #include "RakPeerInterface.h"
 #include "ReliabilityLayer.h"
 #include "RPCNode.h"
@@ -63,6 +64,10 @@ namespace RakNet
 	class RAK_DLL_EXPORT RakPeer : public RakPeerInterface
 	{
 	public:
+		// Socket/worker lane only while the adapter is immutable for this attempt.
+		int DecodeClientWire(unsigned int address, unsigned short port, unsigned char* bytes, int length) noexcept;
+		unsigned short ClientWireCookieMask() const noexcept;
+
 		///Constructor
 		RakPeer();
 
@@ -521,6 +526,9 @@ namespace RakNet
 		unsigned short GetNumberOfActivePeers();
 
 	protected:
+		void InstallClientWireAdapter(ClientWireAdapter adapter) noexcept;
+		bool BeginClientWire(unsigned int address, unsigned short port) noexcept;
+
 
 	#ifdef _WIN32
 		// friend unsigned __stdcall RecvFromNetworkLoop(LPVOID arguments);
@@ -801,6 +809,12 @@ namespace RakNet
 		DataStructures::SingleProducerConsumer<Packet*> packetSingleProducerConsumer;
 		//DataStructures::Queue<Packet*> pushedBackPacket, outOfOrderDeallocatedPacket;
 		DataStructures::Queue<Packet*> packetPool;
+
+	private:
+		void EndClientWire() noexcept;
+		ClientWireAdapter clientWireAdapter{};
+		unsigned short clientWireCookieMask{ SAMPRakNet::SAMP_PETARDED };
+		bool clientWireActive{};
 	};
 }
 

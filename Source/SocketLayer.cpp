@@ -404,6 +404,13 @@ int SocketLayer::RecvFrom( const SOCKET s, RakPeer *rakPeer, int *errorCode )
 	if ( len != SOCKET_ERROR )
 	{
 		const unsigned short portnum = ntohs(sa.sin_port);
+        if (SAMPRakNet::IsClientRole())
+        {
+            len = rakPeer->DecodeClientWire(sa.sin_addr.s_addr, portnum,
+                reinterpret_cast<unsigned char*>(data), len);
+            if (len == 0)
+                return 1;
+        }
 #ifdef _DEBUG
 		if (SAMPRakNet::IsClientRole() && len > 0 && IsOfflineConnectionPacket(static_cast<unsigned char>(data[0])))
 		{
@@ -419,8 +426,8 @@ int SocketLayer::RecvFrom( const SOCKET s, RakPeer *rakPeer, int *errorCode )
 
 		if (SAMPRakNet::IsClientRole())
 		{
-			// Legacy SA-MP servers send ordinary RakNet datagrams to clients.
-			// The client encoder is applied only on the outbound path.
+			// The optional client adapter has already decoded this datagram.
+			// Without an adapter, legacy SA-MP receives remain ordinary RakNet bytes.
 			ProcessNetworkPacket(sa.sin_addr.s_addr, portnum, data, len, rakPeer);
 		}
 		else

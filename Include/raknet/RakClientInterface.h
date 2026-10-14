@@ -19,6 +19,7 @@
 #define __RAK_CLIENT_INTERFACE_H
 
 #include "NetworkTypes.h"
+#include "ClientWireAdapter.h"
 #include "PacketPriority.h"
 #include "RakPeerInterface.h"
 #include "BitStream.h"
@@ -35,6 +36,9 @@ namespace RakNet
 	public:
 		/// Destructor
 		virtual ~RakClientInterface() {}
+
+		// Replacing the borrowed adapter first stops and drains the previous attempt.
+		virtual void SetClientWireAdapter(ClientWireAdapter adapter) = 0;
 
 		///Call this to connect the client to the specified host (ip or domain name) and server port.
 		/// This is a non-blocking connection.  You know the connection is successful when IsConnected() returns true

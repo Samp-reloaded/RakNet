@@ -43,6 +43,8 @@ namespace RakNet
 		/// Destructor
 		virtual ~RakClient();
 
+		void SetClientWireAdapter(ClientWireAdapter adapter) override;
+
 		///Call this to connect the client to the specified host (ip or domain name) and server port.
 		/// This is a non-blocking connection.  You know the connection is successful when IsConnected() returns true
 		/// or receive gets a packet with the type identifier ID_CONNECTION_REQUEST_ACCEPTED.

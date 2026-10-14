@@ -613,10 +613,67 @@ bool RakPeer::Connect( const char* host, unsigned short remotePort, char* passwo
 	return SendConnectionRequest( host, remotePort, passwordData, passwordDataLength );
 }
 
-// --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-// Description:
-// Stops the network threads and close all connections.  Multiple calls are ok.
-// --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// The installed SDK adapter is immutable from worker start through worker stop.
+void RakPeer::InstallClientWireAdapter(ClientWireAdapter adapter) noexcept
+{
+    RakAssert(endThreads && !isMainLoopThreadActive && !clientWireActive);
+    if (!endThreads || isMainLoopThreadActive || clientWireActive)
+        return;
+    const bool empty = adapter.context == nullptr && adapter.begin == nullptr
+        && adapter.end == nullptr && adapter.decode == nullptr;
+    const bool complete = adapter.context != nullptr && adapter.begin != nullptr
+        && adapter.end != nullptr && adapter.decode != nullptr;
+    RakAssert(empty || complete);
+    if (empty || complete)
+        clientWireAdapter = adapter;
+}
+
+bool RakPeer::BeginClientWire(unsigned int address, unsigned short port) noexcept
+{
+    RakAssert(endThreads && !isMainLoopThreadActive && !clientWireActive);
+    if (!endThreads || isMainLoopThreadActive || clientWireActive)
+        return false;
+    if (clientWireAdapter.begin == nullptr)
+        return true;
+    const unsigned short mask = clientWireAdapter.begin(clientWireAdapter.context, address, port);
+    if (mask != SAMPRakNet::SAMP_PETARDED && mask != SAMPRakNet::OMP_PETARDED)
+    {
+        clientWireAdapter.end(clientWireAdapter.context);
+        return false;
+    }
+    clientWireCookieMask = mask;
+    clientWireActive = true;
+    return true;
+}
+
+void RakPeer::EndClientWire() noexcept
+{
+    RakAssert(endThreads && !isMainLoopThreadActive);
+    if (clientWireActive)
+    {
+        clientWireActive = false;
+        clientWireAdapter.end(clientWireAdapter.context);
+    }
+    clientWireCookieMask = SAMPRakNet::SAMP_PETARDED;
+}
+
+int RakPeer::DecodeClientWire(unsigned int address, unsigned short port,
+    unsigned char* bytes, int length) noexcept
+{
+    if (bytes == nullptr || length <= 0)
+        return 0;
+    if (!clientWireActive)
+        return length;
+    const int decoded = clientWireAdapter.decode(clientWireAdapter.context, address, port, bytes, length);
+    return decoded > 0 && decoded <= length ? decoded : 0;
+}
+
+unsigned short RakPeer::ClientWireCookieMask() const noexcept
+{
+    return clientWireCookieMask;
+}
+
+// Stops the network threads and closes all connections. Multiple calls are safe.
 void RakPeer::Disconnect( unsigned int blockDuration, unsigned char orderingChannel )
 {
 	unsigned i,j;
@@ -681,6 +738,8 @@ void RakPeer::Disconnect( unsigned int blockDuration, unsigned char orderingChan
 
 	while ( isMainLoopThreadActive )
 		RakSleep(15);
+
+	EndClientWire();
 
 	// remoteSystemList in Single thread
 	for ( i = 0; i < systemListSize; i++ )
@@ -4101,7 +4160,7 @@ namespace RakNet
 
 					unsigned char request[3];
 					request[0] = ID_OPEN_CONNECTION_REQUEST;
-					const unsigned short response = static_cast<unsigned short>(cookie ^ SAMPRakNet::SAMP_PETARDED);
+					const unsigned short response = static_cast<unsigned short>(cookie ^ rakPeer->ClientWireCookieMask());
 					memcpy(request + 1, &response, sizeof(response));
 					for (i = 0; i < rakPeer->messageHandlerList.Size(); i++)
 						rakPeer->messageHandlerList[i]->OnDirectSocketSend((const char*)request, sizeof(request) * 8, playerId);
@@ -4502,12 +4561,12 @@ namespace RakNet
 				char c[3] = {};
 				c[0] = ID_OPEN_CONNECTION_REQUEST;
 				const unsigned short requestCookie = rcs->hasConnectionCookie
-					? static_cast<unsigned short>(rcs->connectionCookie ^ SAMPRakNet::SAMP_PETARDED)
+					? static_cast<unsigned short>(rcs->connectionCookie ^ ClientWireCookieMask())
 					: 0;
 				// The server reads the two bytes after the packet id as the
 				// cookie response.  A zero value preserves the legacy first
-				// request; after a challenge this is the SA-MP 0.3.7-compatible
-				// response expected by open.mp's legacy RakNet hook.
+				// request; after a challenge the selected client wire mode supplies
+				// the SA-MP or open.mp response mask for both immediate sends and retries.
 				memcpy(c + 1, &requestCookie, sizeof(requestCookie));
 
 				unsigned i;

@@ -39,38 +39,65 @@ RakClient::RakClient()
 
 // Destructor
 RakClient::~RakClient()
-{}
+{
+    RakPeer::Disconnect(0, 0);
+}
+
+void RakClient::SetClientWireAdapter(ClientWireAdapter adapter)
+{
+    RakPeer::Disconnect(0, 0);
+    InstallClientWireAdapter(adapter);
+}
 
 #ifdef _MSC_VER
 #pragma warning( disable : 4100 ) // warning C4100: 'depreciated' : unreferenced formal parameter
 #endif
 bool RakClient::Connect( const char* host, unsigned short serverPort, unsigned short clientPort, unsigned int depreciated, int threadSleepTimer )
 {
-	SAMPRakNet::SetClientRole();
-	RakPeer::Disconnect( 100 );
-	
-	RakPeer::Initialize( 1, clientPort, threadSleepTimer );
-	
-	if ( host[ 0 ] < '0' || host[ 0 ] > '2' )
-	{
+    SAMPRakNet::SetClientRole();
+    RakPeer::Disconnect(100);
+
+    if (host == nullptr || host[0] == '\0')
+        return false;
+    if (host[0] < '0' || host[0] > '2')
+    {
 #if !defined(_COMPATIBILITY_1)
-		host = ( char* ) SocketLayer::Instance()->DomainNameToIP( host );
+        host = SocketLayer::Instance()->DomainNameToIP(host);
 #else
-		return false;
+        return false;
 #endif
-	}
-	
-	unsigned i;
-	
-	for ( i = 0; i < 32; i++ )
-	{
-		otherClients[ i ].isActive = false;
-		otherClients[ i ].playerId = UNASSIGNED_PLAYER_ID;
-		otherClients[ i ].staticData.Reset();
-	}
-	
-	// ignore depreciated. A pointless variable
-	return RakPeer::Connect( host, serverPort, ( char* ) password.GetData(), password.GetNumberOfBytesUsed() );
+        if (host == nullptr)
+            return false;
+    }
+
+    if (!BeginClientWire(inet_addr(host), serverPort))
+        return false;
+
+    try
+    {
+        if (!RakPeer::Initialize(1, clientPort, threadSleepTimer))
+        {
+            RakPeer::Disconnect(0, 0);
+            return false;
+        }
+
+        for (unsigned i = 0; i < 32; ++i)
+        {
+            otherClients[i].isActive = false;
+            otherClients[i].playerId = UNASSIGNED_PLAYER_ID;
+            otherClients[i].staticData.Reset();
+        }
+
+        if (RakPeer::Connect(host, serverPort, (char*)password.GetData(), password.GetNumberOfBytesUsed()))
+            return true;
+    }
+    catch (...)
+    {
+        RakPeer::Disconnect(0, 0);
+        throw;
+    }
+    RakPeer::Disconnect(0, 0);
+    return false;
 }
 
 void RakClient::Disconnect( unsigned int blockDuration, unsigned char orderingChannel )
