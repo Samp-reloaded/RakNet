@@ -16,7 +16,7 @@ namespace RakNet
 	public:
 		[[nodiscard]] static ReceiveResult PacketReceived(Packet& packet) { return {ReceiveStatus::Packet, &packet, ReceiveFailure::None}; }
 		[[nodiscard]] static ReceiveResult Empty() { return {ReceiveStatus::Empty, nullptr, ReceiveFailure::None}; }
-		[[nodiscard]] static ReceiveResult Yield() { return {ReceiveStatus::Yield, nullptr, ReceiveFailure::None}; }
+		[[nodiscard]] static ReceiveResult Yielded() { return {ReceiveStatus::Yield, nullptr, ReceiveFailure::None}; }
 		[[nodiscard]] static ReceiveResult Failed(ReceiveFailure failure) { return {ReceiveStatus::Failure, nullptr, failure}; }
 		[[nodiscard]] ReceiveStatus GetStatus() const { return status; }
 		// SDK ownership transfers only on Packet; release through DeallocatePacket.

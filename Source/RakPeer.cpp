@@ -1113,7 +1113,7 @@ ReceiveResult RakPeer::ReceiveIgnoreRPCInternal(ReceiveBudget& budget)
 		if (pluginCount > (budget.workLimit - 1) / 2)
 			return ReceiveResult::Failed(ReceiveFailure::InvalidBudget);
 		if (!budget.CanChargeWork(pluginCount))
-			return ReceiveResult::Yield();
+			return ReceiveResult::Yielded();
 		budget.pluginsUpdated = true;
 		budget.workUnits += pluginCount;
 		for (std::size_t index = 0; index < pluginCount && index < messageHandlerList.Size(); ++index)
@@ -1136,7 +1136,7 @@ ReceiveResult RakPeer::ReceiveIgnoreRPCInternal(ReceiveBudget& budget)
 				rakPeerMutexes[packetPool_Mutex].Unlock();
 				rakPeerMutexes[transferToPacketQueue_Mutex].Unlock();
 #endif
-				return ReceiveResult::Yield();
+				return ReceiveResult::Yielded();
 			}
 			if (!deferredTailPackets.IsEmpty() && deferredTailPackets.Peek().producerWatermark <= transferredReceiveSequence)
 			{
@@ -1185,7 +1185,7 @@ ReceiveResult RakPeer::ReceiveIgnoreRPCInternal(ReceiveBudget& budget)
 				DeallocatePacket(packet);
 				return ReceiveResult::Failed(ReceiveFailure::OversizedPacket);
 			}
-			return invalidWorkBudget ? ReceiveResult::Failed(ReceiveFailure::InvalidBudget) : ReceiveResult::Yield();
+			return invalidWorkBudget ? ReceiveResult::Failed(ReceiveFailure::InvalidBudget) : ReceiveResult::Yielded();
 		}
 		packetPool.Pop();
 		budget.ChargePacket(packet->length, packetWork);
