@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <string>
 #include <exception>
 
@@ -109,10 +110,10 @@ public:
 		return (static_cast<PlayerAddressHash>(player.binaryAddress) << 16) | player.port;
 	}
 
-	static void SetNetworkRole(NetworkRole role) { networkRole_ = role; }
+	static void SetNetworkRole(NetworkRole role) { networkRole_.store(role, std::memory_order_release); }
 	static void SetClientRole() { SetNetworkRole(NetworkRole::Client); }
 	static void SetServerRole() { SetNetworkRole(NetworkRole::Server); }
-	static bool IsClientRole() { return networkRole_ == NetworkRole::Client; }
+	static bool IsClientRole() { return networkRole_.load(std::memory_order_acquire) == NetworkRole::Client; }
 
 	static uint8_t* Decrypt(uint8_t const* src, int len);
 	// The legacy SA-MP wire format is direction-sensitive: client datagrams are
@@ -271,5 +272,5 @@ private:
 	static FlatHashSet<uint32_t> incomingConnections_;
 	static RakNet::RakNetTime gracePeriod_;
 	static FlatHashMap<PlayerAddressHash, OmpPlayerEncryptionData> ompPlayers_;
-	static NetworkRole networkRole_;
+	static std::atomic<NetworkRole> networkRole_;
 };

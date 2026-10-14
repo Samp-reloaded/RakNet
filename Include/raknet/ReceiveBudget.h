@@ -9,7 +9,7 @@ namespace RakNet
 {
 	// a caller shares one ledger across its complete owner-lane slice.
 	enum class ReceiveStatus : unsigned int { Packet, Empty, Yield, Failure };
-	enum class ReceiveFailure : unsigned int { None, InvalidBudget, OversizedPacket, MalformedPacket, ReentrantReceive };
+	enum class ReceiveFailure : unsigned int { None, InvalidBudget, OversizedPacket, MalformedPacket, ReentrantReceive, WorkerStopped };
 
 	class ReceiveResult
 	{

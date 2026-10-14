@@ -27,7 +27,7 @@ ICore* SAMPRakNet::core_ = nullptr;
 FlatHashSet<uint32_t> SAMPRakNet::incomingConnections_;
 RakNet::RakNetTime SAMPRakNet::gracePeriod_ = 0;
 FlatHashMap<PlayerAddressHash, SAMPRakNet::OmpPlayerEncryptionData> SAMPRakNet::ompPlayers_;
-SAMPRakNet::NetworkRole SAMPRakNet::networkRole_ = SAMPRakNet::NetworkRole::Server;
+std::atomic<SAMPRakNet::NetworkRole> SAMPRakNet::networkRole_{SAMPRakNet::NetworkRole::Server};
 
 uint16_t
 SAMPRakNet::

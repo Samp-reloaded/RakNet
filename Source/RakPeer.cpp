@@ -47,6 +47,7 @@
 #include "RakAssert.h"
 #include <limits>
 #include <memory>
+#include <exception>
 
 #if !defined ( __APPLE__ ) && !defined ( __APPLE_CC__ )
 #include <malloc.h>
@@ -140,6 +141,7 @@ static const int MAX_OFFLINE_DATA_LENGTH=400; // I set this because I limit ID_C
 
 namespace
 {
+	thread_local RakPeer* currentNetworkWorker{};
 	bool HasValidPacketExtent(const Packet& packet)
 	{
 		if (!packet.data || packet.length == 0 || packet.bitSize < 8 ||
@@ -263,10 +265,8 @@ RakPeer::~RakPeer()
 {
 //	unsigned i;
 
-	// Free the ban list.
-	ClearBanList();
-
 	Disconnect( 0, 0);
+	ClearBanList();
 
 
 	StringCompressor::RemoveReference();
@@ -292,8 +292,14 @@ RakPeer::~RakPeer()
 // --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 bool RakPeer::Initialize( unsigned short maxConnections, unsigned short localPort, int _threadSleepTimer, const char *forceHostAddress )
 {
-	if (IsActive())
+	if (currentNetworkWorker == this)
 		return false;
+	if (IsActive() || disconnectInProgress)
+		return false;
+	// A previous worker may have stopped itself after a socket failure. Its
+	// retained handle still needs joining before any state can be reused.
+	if (networkWorkerJoinable)
+		Disconnect(0, 0);
 
 	unsigned i;
 
@@ -318,7 +324,14 @@ bool RakPeer::Initialize( unsigned short maxConnections, unsigned short localPor
 	if (_threadSleepTimer>0)
 	{
 		recvEvent=CreateEvent(0,FALSE,FALSE,0);
-		WSAEventSelect(connectionSocket,recvEvent,FD_READ);
+		if (recvEvent == nullptr || WSAEventSelect(connectionSocket, recvEvent, FD_READ) == SOCKET_ERROR)
+		{
+			if (recvEvent != nullptr)
+				CloseHandle(recvEvent);
+			recvEvent = INVALID_HANDLE_VALUE;
+			Disconnect(0, 0);
+			return false;
+		}
 	}	
 #endif
 
@@ -367,7 +380,8 @@ bool RakPeer::Initialize( unsigned short maxConnections, unsigned short localPor
 		rawBytesSent = rawBytesReceived = compressedBytesSent = compressedBytesReceived = 0;
 
 		updateCycleIsRunning = false;
-		endThreads = false;
+		networkWorkerStarted.store(false, std::memory_order_relaxed);
+		networkWorkerFailed.store(false, std::memory_order_relaxed);
 		// Create the threads
 		threadSleepTimer = _threadSleepTimer;
 
@@ -384,6 +398,7 @@ bool RakPeer::Initialize( unsigned short maxConnections, unsigned short localPor
 #else
 		myPlayerId=UNASSIGNED_PLAYER_ID;
 #endif
+		endThreads.store(false, std::memory_order_release);
 		{
 #ifdef _WIN32
 
@@ -409,42 +424,35 @@ bool RakPeer::Initialize( unsigned short maxConnections, unsigned short localPor
 
 				// SetThreadPriority(processPacketsThreadHandle, THREAD_PRIORITY_HIGHEST);
 
-				CloseHandle( processPacketsThreadHandle );
-
-				processPacketsThreadHandle = 0;
+				networkWorkerJoinable = true;
 
 			}
 
 #else
-			pthread_attr_t attr;
-			pthread_attr_init( &attr );
-			pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
-
-			//  sched_param sp;
-			//  sp.sched_priority = sched_get_priority_max(SCHED_OTHER);
-			//  pthread_attr_setschedparam(&attr, &sp);
-
-			int error;
-
 			if ( isMainLoopThreadActive == false )
 			{
-				error = pthread_create( &processPacketsThreadHandle, &attr, &UpdateNetworkLoop, this );
+				// Default pthread attributes create a joinable worker.
+				const int error = pthread_create(&processPacketsThreadHandle, nullptr, &UpdateNetworkLoop, this);
 
 				if ( error )
 				{
 					Disconnect( 0 );
 					return false;
 				}
+				networkWorkerJoinable = true;
 			}
-
-			processPacketsThreadHandle = 0;
 #endif
 
 
 			// Wait for the threads to activate.  When they are active they will set these variables to true
 
-			while (  /*isRecvfromThreadActive==false || */isMainLoopThreadActive == false )
+			while (!networkWorkerStarted.load(std::memory_order_acquire))
 				RakSleep(10);
+			if (endThreads.load(std::memory_order_acquire))
+			{
+				Disconnect(0, 0);
+				return false;
+			}
 
 		}
 	}
@@ -672,8 +680,8 @@ bool RakPeer::Connect( const char* host, unsigned short remotePort, char* passwo
 // The installed SDK adapter is immutable from worker start through worker stop.
 void RakPeer::InstallClientWireAdapter(ClientWireAdapter adapter) noexcept
 {
-    RakAssert(endThreads && !isMainLoopThreadActive && !clientWireActive);
-    if (!endThreads || isMainLoopThreadActive || clientWireActive)
+    RakAssert(endThreads && !isMainLoopThreadActive && !networkWorkerJoinable && !clientWireActive);
+    if (!endThreads || isMainLoopThreadActive || networkWorkerJoinable || clientWireActive)
         return;
     const bool empty = adapter.context == nullptr && adapter.begin == nullptr
         && adapter.end == nullptr && adapter.decode == nullptr;
@@ -686,8 +694,8 @@ void RakPeer::InstallClientWireAdapter(ClientWireAdapter adapter) noexcept
 
 bool RakPeer::BeginClientWire(unsigned int address, unsigned short port) noexcept
 {
-    RakAssert(endThreads && !isMainLoopThreadActive && !clientWireActive);
-    if (!endThreads || isMainLoopThreadActive || clientWireActive)
+    RakAssert(endThreads && !isMainLoopThreadActive && !networkWorkerJoinable && !clientWireActive);
+    if (!endThreads || isMainLoopThreadActive || networkWorkerJoinable || clientWireActive)
         return false;
     if (clientWireAdapter.begin == nullptr)
         return true;
@@ -704,7 +712,7 @@ bool RakPeer::BeginClientWire(unsigned int address, unsigned short port) noexcep
 
 void RakPeer::EndClientWire() noexcept
 {
-    RakAssert(endThreads && !isMainLoopThreadActive);
+    RakAssert(endThreads && !isMainLoopThreadActive && !networkWorkerJoinable);
     if (clientWireActive)
     {
         clientWireActive = false;
@@ -729,71 +737,91 @@ unsigned short RakPeer::ClientWireCookieMask() const noexcept
     return clientWireCookieMask;
 }
 
-// Stops the network threads and closes all connections. Multiple calls are safe.
+void RakPeer::JoinNetworkWorker()
+{
+	endThreads.store(true, std::memory_order_release);
+	if (!networkWorkerJoinable)
+		return;
+	RakAssert(currentNetworkWorker != this);
+	if (currentNetworkWorker == this)
+		std::terminate(); // Owner destruction cannot run on its worker.
+#ifdef _WIN32
+#if defined(USE_WAIT_FOR_MULTIPLE_EVENTS)
+	if (recvEvent != INVALID_HANDLE_VALUE)
+		SetEvent(recvEvent);
+#endif
+	const DWORD waitResult = WaitForSingleObject(processPacketsThreadHandle, INFINITE);
+	RakAssert(waitResult == WAIT_OBJECT_0);
+	if (waitResult != WAIT_OBJECT_0)
+		std::terminate(); // No teardown is safe without termination proof.
+	const BOOL closed = CloseHandle(processPacketsThreadHandle);
+	RakAssert(closed);
+	if (!closed)
+		std::terminate();
+	processPacketsThreadHandle = nullptr;
+#else
+	const int joinResult = pthread_join(processPacketsThreadHandle, nullptr);
+	RakAssert(joinResult == 0);
+	if (joinResult != 0)
+		std::terminate();
+	processPacketsThreadHandle = {};
+#endif
+	const bool stillRunning = isMainLoopThreadActive.load(std::memory_order_acquire);
+	RakAssert(!stillRunning);
+	if (stillRunning)
+		std::terminate();
+	networkWorkerJoinable = false;
+}
+
+// Stops the network worker and closes all connections on the owner lane.
 void RakPeer::Disconnect( unsigned int blockDuration, unsigned char orderingChannel )
 {
-	unsigned i,j;
-	bool anyActive;
-	RakNetTime startWaitingTime;
-//	PlayerID playerId;
-	RakNetTime time;
-	//unsigned short systemListSize = remoteSystemListSize; // This is done for threading reasons
-	unsigned short systemListSize = maximumNumberOfPeers;
-
-	if ( blockDuration > 0 )
+	RakAssert(currentNetworkWorker != this);
+	if (currentNetworkWorker == this)
+		std::terminate();
+	if (disconnectInProgress)
+		return;
+	disconnectInProgress = true;
+	struct DisconnectScope
 	{
-		for ( i = 0; i < systemListSize; i++ )
-		{
-			// remoteSystemList in user thread
-			NotifyAndFlagForDisconnect(remoteSystemList[i].playerId, false, orderingChannel);
-		}
+		bool& inProgress;
+		~DisconnectScope() { inProgress = false; }
+	} disconnectScope{disconnectInProgress};
+	unsigned int i{};
+	const unsigned short systemListSize = maximumNumberOfPeers;
 
-		time = RakNet::GetTime();
-		startWaitingTime = time;
-		while ( time - startWaitingTime < blockDuration )
+	if (blockDuration > 0 && networkWorkerJoinable && !endThreads.load(std::memory_order_acquire))
+	{
+		// Resolve mutable peer slots on their worker, rather than racing owner
+		// reads of player IDs or active flags during graceful disconnect.
 		{
-			anyActive=false;
-			for (j=0; j < systemListSize; j++)
+#ifdef _RAKNET_THREADSAFE
+			SimpleMutex& mutex = rakPeerMutexes[bufferedCommands_Mutex];
+			mutex.Lock();
+			struct QueueUnlock
 			{
-				// remoteSystemList in user thread
-				if (remoteSystemList[j].isActive)
-				{
-					anyActive=true;
-					break;
-				}
-			}
-
-			// If this system is out of packets to send, then stop waiting
-			if ( anyActive==false )
-				break;
-
-			// This will probably cause the update thread to run which will probably
-			// send the disconnection notification
-
-			RakSleep(15);
-			time = RakNet::GetTime();
+				SimpleMutex& mutex;
+				~QueueUnlock() { mutex.Unlock(); }
+			} unlock{mutex};
+#endif
+			BufferedCommandStruct* command = bufferedCommands.WriteLock();
+			command->command = BufferedCommandStruct::BCS_DISCONNECT_ALL;
+			command->orderingChannel = static_cast<char>(orderingChannel);
+			command->data = nullptr;
+			bufferedCommands.WriteUnlock();
 		}
+		const RakNetTime startWaitingTime = RakNet::GetTime();
+		while (!endThreads.load(std::memory_order_acquire) && activePeersCount.load(std::memory_order_acquire) > 0 &&
+			RakNet::GetTime() - startWaitingTime < blockDuration)
+			RakSleep(15);
 	}
 
+	JoinNetworkWorker();
+	// No worker callback can race plugin/context retirement after this join.
 	for (i=0; i < messageHandlerList.Size(); i++)
 	{
 		messageHandlerList[i]->OnDisconnect(this);
 	}
-
-	if ( endThreads == false )
-	{
-		// Stop the threads
-		endThreads = true;
-
-		// Normally the thread will call DecreaseUserCount on termination but if we aren't using threads just do it
-		// manually
-#ifdef __USE_IO_COMPLETION_PORTS
-		AsynchronousFileIO::Instance()->DecreaseUserCount();
-#endif
-	}
-
-	while ( isMainLoopThreadActive )
-		RakSleep(15);
 
 	EndClientWire();
 
@@ -1073,6 +1101,8 @@ Packet* RakPeer::ReceiveIgnoreRPC( void )
 
 ReceiveResult RakPeer::ReceiveIgnoreRPCInternal(ReceiveBudget& budget)
 {
+	if (networkWorkerFailed.load(std::memory_order_acquire))
+		return ReceiveResult::Failed(ReceiveFailure::WorkerStopped);
 	if (!IsActive())
 		return ReceiveResult::Empty();
 	if (!budget.pluginsUpdated)
@@ -4046,11 +4076,14 @@ void RakPeer::ClearRequestedConnectionList(void)
 }
 inline void RakPeer::AddPacketToProducer(Packet *p)
 {
+	const auto releasePacket = [this](Packet* packet) { DeallocatePacket(packet); };
+	std::unique_ptr<Packet, decltype(releasePacket)> owner{p, releasePacket};
 	p->receiveSequence = ++nextReceiveSequence;
 	Packet **packetPtr=packetSingleProducerConsumer.WriteLock();
 	*packetPtr=p;
 	publishedReceiveSequence.store(nextReceiveSequence, std::memory_order_release);
 	packetSingleProducerConsumer.WriteUnlock();
+	owner.release();
 }
 // --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -4571,8 +4604,8 @@ namespace RakNet
 	#endif
 						// Some kind of critical error
 						// peer->isRecvfromThreadActive=false;
-						endThreads = true;
-						Disconnect( 0, 0 );
+						networkWorkerFailed.store(true, std::memory_order_release);
+						endThreads.store(true, std::memory_order_release);
 						return false;
 					}
 
@@ -4580,8 +4613,8 @@ namespace RakNet
 				if ( errorCode == -1 )
 				{
 					// isRecvfromThreadActive=false;
-					endThreads = true;
-					Disconnect( 0 );
+					networkWorkerFailed.store(true, std::memory_order_release);
+					endThreads.store(true, std::memory_order_release);
 					return false;
 				}
 	#endif
@@ -4616,6 +4649,14 @@ namespace RakNet
 				//		remoteSystem=AssignSystemAddressToRemoteSystemList(bcs->systemAddress, bcs->connectionMode);
 					if (remoteSystem)
 						remoteSystem->connectMode=bcs->connectionMode;
+				}
+			}
+			else if (bcs->command == BufferedCommandStruct::BCS_DISCONNECT_ALL)
+			{
+				for (unsigned int index = 0; index < maximumNumberOfPeers; ++index)
+				{
+					if (remoteSystemList[index].isActive)
+						NotifyAndFlagForDisconnect(remoteSystemList[index].playerId, true, static_cast<unsigned char>(bcs->orderingChannel));
 				}
 			}
 			else
@@ -5356,37 +5397,16 @@ namespace RakNet
 	void* UpdateNetworkLoop( void* arguments )
 	#endif
 	{
-		RakPeer * rakPeer = ( RakPeer * ) arguments;
-		// RakNetTime time;
-
-	#ifdef __USE_IO_COMPLETION_PORTS
-
-		AsynchronousFileIO::Instance()->IncreaseUserCount();
-	#endif
-
-		// 11/15/05 - this is slower than Sleep()
-	#ifdef _WIN32
-	#if (_WIN32_WINNT >= 0x0400) || (_WIN32_WINDOWS > 0x0400)
-		// Lets see if these timers give better performance than Sleep
-		HANDLE timerHandle;
-		LARGE_INTEGER dueTime;
-
-		if ( rakPeer->threadSleepTimer <= 0 )
-			rakPeer->threadSleepTimer = 1;
-
-		// 2nd parameter of false means synchronization timer instead of manual-reset timer
-		timerHandle = CreateWaitableTimer( NULL, FALSE, 0 );
-
-		RakAssert( timerHandle );
-
-		dueTime.QuadPart = -10000 * rakPeer->threadSleepTimer; // 10000 is 1 ms?
-
-		BOOL success = SetWaitableTimer( timerHandle, &dueTime, rakPeer->threadSleepTimer, NULL, NULL, FALSE );
-
-		RakAssert( success );
-
-	#endif
-	#endif
+		RakPeer* rakPeer = static_cast<RakPeer*>(arguments);
+		currentNetworkWorker = rakPeer;
+		const bool stopBeforeStart = rakPeer->endThreads.load(std::memory_order_acquire);
+		int sleepInterval = stopBeforeStart ? 0 : rakPeer->threadSleepTimer;
+#if defined(_WIN32) && ((_WIN32_WINNT >= 0x0400) || (_WIN32_WINDOWS > 0x0400))
+		// Retain the existing Windows sleep policy without creating an unused
+		// waitable timer or changing a field shared with the owner.
+		if (sleepInterval <= 0)
+			sleepInterval = 1;
+#endif
 
 	#ifdef _RAKNET_THREADSAFE
 		#pragma message("-- RakNet: _RAKNET_THREADSAFE defined.  Safe to use multiple threads on the same instance of RakPeer (Slow!). --")
@@ -5394,30 +5414,52 @@ namespace RakNet
 		#pragma message("-- RakNet: _RAKNET_THREADSAFE not defined.  Do NOT use multiple threads on the same instance of RakPeer (Fast!). --")
 	#endif
 
-		rakPeer->isMainLoopThreadActive = true;
-
-		while ( rakPeer->endThreads == false )
+		rakPeer->isMainLoopThreadActive.store(true, std::memory_order_release);
+		rakPeer->networkWorkerStarted.store(true, std::memory_order_release);
+#ifdef __USE_IO_COMPLETION_PORTS
+		bool ioReference{};
+#endif
+		try
 		{
-			rakPeer->RunUpdateCycle();
-			if (rakPeer->threadSleepTimer>=0)
-			{
-	#if defined(USE_WAIT_FOR_MULTIPLE_EVENTS)
-				if (rakPeer->threadSleepTimer>0)
-					WSAWaitForMultipleEvents(1,&rakPeer->recvEvent,TRUE,rakPeer->threadSleepTimer,FALSE);
-				else
-					RakSleep(0);
-	#else // _WIN32
-					RakSleep( rakPeer->threadSleepTimer );
+	#ifdef __USE_IO_COMPLETION_PORTS
+			AsynchronousFileIO::Instance()->IncreaseUserCount();
+			ioReference = true;
 	#endif
+			while (!rakPeer->endThreads.load(std::memory_order_acquire))
+			{
+				if (!rakPeer->RunUpdateCycle())
+				{
+					if (!rakPeer->endThreads.load(std::memory_order_acquire))
+						rakPeer->networkWorkerFailed.store(true, std::memory_order_release);
+					rakPeer->endThreads.store(true, std::memory_order_release);
+					break;
+				}
+				if (rakPeer->endThreads.load(std::memory_order_acquire))
+					break;
+				if (sleepInterval >= 0)
+				{
+	#if defined(_WIN32) && defined(USE_WAIT_FOR_MULTIPLE_EVENTS)
+					if (sleepInterval > 0 && rakPeer->recvEvent != INVALID_HANDLE_VALUE)
+						WSAWaitForMultipleEvents(1, &rakPeer->recvEvent, TRUE, static_cast<DWORD>(sleepInterval), FALSE);
+					else
+	#endif
+						RakSleep(static_cast<unsigned int>(sleepInterval));
+				}
 			}
 		}
-
-
+		catch (...)
+		{
+			// Legacy send/callback operations do not promise transactional
+			// exception recovery. Do not retire ambiguous in-flight ownership.
+			std::terminate();
+		}
 	#ifdef __USE_IO_COMPLETION_PORTS
-		AsynchronousFileIO::Instance()->DecreaseUserCount();
+		if (ioReference)
+			AsynchronousFileIO::Instance()->DecreaseUserCount();
 	#endif
 
-		rakPeer->isMainLoopThreadActive = false;
+		currentNetworkWorker = nullptr;
+		rakPeer->isMainLoopThreadActive.store(false, std::memory_order_release);
 
 		return 0;
 	}

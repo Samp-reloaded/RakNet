@@ -39,7 +39,9 @@ queue was empty or the peer inactive at the observation; `Yield` means this
 ledger cannot admit more work. Neither establishes remote disconnect.
 
 `GetFailure()` distinguishes `InvalidBudget`, `OversizedPacket`,
-`MalformedPacket`, and `ReentrantReceive`; other statuses report `None`.
+`MalformedPacket`, `ReentrantReceive`, and `WorkerStopped`; other statuses report
+`None`. `WorkerStopped` reports a local native worker/socket failure, not a
+remote administrative close.
 Zero capacities or a work budget unable to fit mandatory plugin updates plus
 one packet's plugin chain are invalid (`2 * plugin count + 1` minimum).
 A packet larger than the full byte capacity is removed and released with
@@ -127,3 +129,39 @@ lap earlier read locks. Growth only changes an acquired free node's link; owned
 Canceled write reservations are reset through the old reservation tail. No node
 is deleted until both endpoints are quiescent for clear or destruction. Size
 observations use atomic counters and remain unsuitable as FIFO barriers.
+
+## Worker stop and owner retirement
+
+The Windows `_beginthreadex` handle is retained until a successful native wait
+and close. POSIX workers use default joinable attributes and `pthread_join`.
+Atomic stop, started, running, and failure receipts replace volatile flags;
+startup waits for a sticky started receipt, so a worker that exits immediately
+cannot strand initialization waiting for a transient running flag.
+
+`Disconnect`, destruction, adapter replacement, and subsequent initialization
+run on the owner lane. They request stop and join the retained worker before
+plugin `OnDisconnect`, wire-adapter retirement, socket close, queue clearing or
+remote-system destruction. Graceful disconnect resolves mutable peer IDs on
+the worker through a queued close-all command; its owner wait observes an atomic
+active-peer count. The process role is atomic across client retry boundaries.
+
+A fatal socket error publishes local failure, requests stop,
+and unwinds the worker. It never calls owner teardown or attempts to join itself.
+Bounded receive exposes a sticky `WorkerStopped` failure until the next native
+initialization resets it. Compatibility receive continues to return null.
+Lifecycle calls from the worker, unexpected worker exceptions, and native
+join/handle corruption fail fast;
+teardown does not continue without proof that the worker terminated.
+
+The unused Windows waitable timer was removed; the existing effective sleep
+policy is retained in a worker-local value. Optional socket events are awakened
+for stop and closed after join. Packet publication retains ownership if queue
+growth fails before publication.
+
+Deferred execution scenarios: immediate worker failure during startup; native
+thread creation failure; repeated connect/disconnect with adapter replacement;
+graceful close while peer slots change; plugin-context destruction after the
+last worker callback; worker socket failure observed as local `WorkerStopped`.
+None was built or executed for this checkpoint. This establishes source-level
+lifecycle ordering, not a claim that every legacy SDK shared field has received
+a complete concurrency audit.

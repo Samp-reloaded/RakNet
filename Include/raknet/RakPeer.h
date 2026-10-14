@@ -593,15 +593,17 @@ namespace RakNet
 		bool SetupIOCompletionPortSocket( int index );
 	#endif
 		///Set this to true to terminate the Peer thread execution 
-		volatile bool endThreads;
+		std::atomic<bool> endThreads{true};
 		///true if the peer thread is active. 
-		volatile bool isMainLoopThreadActive;
+		std::atomic<bool> isMainLoopThreadActive{};
+		std::atomic<bool> networkWorkerStarted{};
+		std::atomic<bool> networkWorkerFailed{};
 		bool occasionalPing;  /// Do we occasionally ping the other systems?*/
 		///Store the maximum number of peers allowed to connect
 		unsigned short maximumNumberOfPeers;
 
 		///Store number of active peers.
-		unsigned short activePeersCount;
+		std::atomic<unsigned int> activePeersCount{};
 
 		///Store reserved slots, for the times slots are taken outside of RakNet
 		unsigned short reservedSlots;
@@ -669,7 +671,9 @@ namespace RakNet
 	#else
 		pthread_t
 	#endif
-			processPacketsThreadHandle, recvfromThreadHandle;
+			processPacketsThreadHandle{};
+		bool networkWorkerJoinable{};
+		bool disconnectInProgress{};
 		SimpleMutex incomingQueueMutex, banListMutex; //,synchronizedMemoryQueueMutex, automaticVariableSynchronizationMutex;
 		//DataStructures::Queue<Packet *> incomingpacketSingleProducerConsumer; //, synchronizedMemorypacketSingleProducerConsumer;
 		// BitStream enumerationData;
@@ -740,7 +744,7 @@ namespace RakNet
 			NetworkID networkID;
 			bool blockingCommand; // Only used for RPC
 			char *data;
-			enum {BCS_SEND, BCS_CLOSE_CONNECTION, /*BCS_RPC, BCS_RPC_SHIFT,*/ BCS_DO_NOTHING} command;
+			enum {BCS_SEND, BCS_CLOSE_CONNECTION, BCS_DISCONNECT_ALL, /*BCS_RPC, BCS_RPC_SHIFT,*/ BCS_DO_NOTHING} command;
 		};
 
 		// Single producer single consumer queue using a linked list
@@ -823,6 +827,7 @@ namespace RakNet
 		bool receiveInProgress{};
 
 	private:
+		void JoinNetworkWorker();
 		void EndClientWire() noexcept;
 		ClientWireAdapter clientWireAdapter{};
 		unsigned short clientWireCookieMask{ SAMPRakNet::SAMP_PETARDED };
